@@ -8,8 +8,34 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Windows shim support (`bw.cmd`/`bw.bat`/`bw.ps1`)** -- Installer methods put
+  different shims on `PATH` and `CreateProcess` can only run real `.exe`/`.com`
+  images. `resolve_bw_command` now resolves all flavours, most-reliable first:
+  native `bw.exe`/`bw.com` run directly; `bw.cmd`/`bw.bat` are routed through
+  `cmd.exe /c` (invoked by basename from their own directory to avoid
+  shell-quoting issues); and a `bw.ps1` (which isn't in `PATHEXT`, so
+  `shutil.which` can't see it) is found on `PATH` and run through PowerShell. So
+  when npm ships both `bw.cmd` and `bw.ps1`, the `cmd` shim is preferred.
+  `terminate_serve` tears the `bw serve` process tree down with `taskkill /F /T`
+  so the real server isn't orphaned behind a `cmd.exe`/PowerShell wrapper. A
+  `windows-bw-cmd` CI job installs `bw` via npm and runs a live smoke test
+  (`tests/windows_bw_cmd_smoke.py`) covering shim invocation (`bw --version`) and
+  `cmd.exe`-wrapped process-tree teardown. Fixes #8.
+
 ### Fixed
 
+- **Missing `bw` CLI traceback** -- When the Bitwarden CLI (`bw`) was not on
+  `PATH`, `kp2bw` crashed with a long, intimidating `FileNotFoundError`
+  traceback from `subprocess`. The CLI now checks for `bw` up front (before
+  prompting for passwords) and exits cleanly with an actionable message; any
+  `BitwardenClientError`/`ConversionError` raised during conversion is reported
+  the same way instead of as a stack trace. `BitwardenServeClient` raises a
+  `BitwardenClientError` rather than letting `FileNotFoundError` escape.
+  Detection uses `shutil.which`, so Windows `bw.exe`/`bw.cmd` shims are found via
+  `PATHEXT`; the `bw` subprocess calls also catch `FileNotFoundError`, so a
+  genuinely missing CLI still yields the friendly message. Fixes #5.
 - **Chained `{REF:...}` references** -- a reference whose target was itself
   another reference entry (a chain `A -> B -> C`) raised `KeyError` in
   `_resolve_entries_with_references`, logged a `Could not resolve entry`
@@ -410,7 +436,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 [`jampe/kp2bw@c9ef571eabd345db94751f7dec845e49756e9d47`](https://github.com/jampe/kp2bw/commit/c9ef571eabd345db94751f7dec845e49756e9d47)
 
-[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/kjanat/kp2bw/compare/v3.0.1...v3.1.0
+[3.0.1]: https://github.com/kjanat/kp2bw/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/kjanat/kp2bw/compare/v3.0.0a1...v3.0.0
 [3.0.0a1]: https://github.com/kjanat/kp2bw/compare/v2.0.0...v3.0.0a1
 [2.0.0]: https://github.com/kjanat/kp2bw/compare/v2.0.0rc3...v2.0.0
