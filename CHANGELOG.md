@@ -8,6 +8,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-06-08
+
 ### Fixed
 
 - **`None` username/password in REF resolution** -- `_resolve_entries_with_references`
@@ -15,7 +17,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with a `{REF:...}` field also had a `None` username or password. The field is
   now guarded before the `KP_REF_IDENTIFIER` membership test, and `None` values
   are normalized to `""` for the username/password match so a resolved entry
-  merges its URI instead of spawning a duplicate. Fixes #9.
+  merges its URI instead of spawning a duplicate. Fixes #9, #4.
 
 ## [3.0.0] - 2026-02-26
 
