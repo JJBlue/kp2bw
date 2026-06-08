@@ -266,7 +266,7 @@ function readConfig(defaultCliName) {
 	const pythonVersion = env.PYTHON_VERSION;
 	return {
 		cliName: env.CLI_NAME || defaultCliName,
-		pyFlag: pythonVersion ? `-p${pythonVersion} ` : '',
+		pyFlag: pythonVersion ? `-p ${pythonVersion} ` : '',
 		cliExamples: env.CLI_EXAMPLES || '',
 	};
 }
