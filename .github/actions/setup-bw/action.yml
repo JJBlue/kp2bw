@@ -17,6 +17,9 @@ outputs:
   bin-dir:
     description: "npm global bin directory containing `bw` (added to PATH)."
     value: ${{ steps.install.outputs.bin-dir }}
+  bin:
+    description: "Absolute path to the installed `bw` executable."
+    value: ${{ steps.install.outputs.bin }}
 
 runs:
   using: composite
@@ -27,23 +30,49 @@ runs:
       env: { BW_VERSION: "${{ inputs.version }}" }
       run: |
         $requested = $env:BW_VERSION
+
         if ([string]::IsNullOrWhiteSpace($requested) -or $requested -eq "latest") {
-          $package = "@bitwarden/cli"
+        	$package = "@bitwarden/cli"
         } else {
-          $package = "@bitwarden/cli@$($requested -replace '^v', '')"
+        	$package = "@bitwarden/cli@$($requested -replace '^v', '')"
         }
 
-        $cacheRoot = if ($env:RUNNER_TOOL_CACHE) { $env:RUNNER_TOOL_CACHE } else { $env:RUNNER_TEMP }
+        $cacheRoot = if ($env:RUNNER_TOOL_CACHE) {
+        	$env:RUNNER_TOOL_CACHE
+        } else { $env:RUNNER_TEMP }
+
         $prefix = Join-Path $cacheRoot "bitwarden-cli"
         New-Item -ItemType Directory -Force -Path $prefix | Out-Null
 
         npm install --global --ignore-scripts --prefix $prefix $package
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-        $binDir = if ($IsWindows) { $prefix } else { Join-Path $prefix "bin" }
-        $bw = if ($IsWindows) { Join-Path $binDir "bw.cmd" } else { Join-Path $binDir "bw" }
+        $binDir = if ($IsWindows) {
+        	$prefix
+        } else { Join-Path $prefix "bin" }
+        $env:PATH = "$binDir$([IO.Path]::PathSeparator)$env:PATH"
+
+        $binRoot = [IO.Path]::GetFullPath($binDir).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $commands = Get-Command bw -All -ErrorAction Stop
+        $installedCommands = $commands | Where-Object {
+        	if (-not $_.Source) { $false } else {
+        		$source = [IO.Path]::GetFullPath($_.Source)
+        		$source -eq $binRoot -or $source.StartsWith("$binRoot$([IO.Path]::DirectorySeparatorChar)", [StringComparison]::OrdinalIgnoreCase)
+        	}
+        }
+
+        $bwCommand = (
+        	$installedCommands |
+        		Where-Object CommandType -eq Application |
+        		Select-Object -First 1
+        ) ?? ($installedCommands | Select-Object -First 1)
+
+        if (-not $bwCommand) { throw "installed bw was not found in $binDir" }
+
+        $bw = $bwCommand.Source
         $versionOutput = & $bw --version
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
         $version = [string]$versionOutput
 
         $binDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
@@ -51,6 +80,7 @@ runs:
         @"
         version=$version
         bin-dir=$binDir
+        bin=$bw
         "@ | Tee-Object -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
         "Bitwarden CLI $version installed at $binDir"
