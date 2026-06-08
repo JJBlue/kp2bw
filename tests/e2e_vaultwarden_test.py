@@ -20,6 +20,7 @@ from _snapshot import (
     assert_matches_golden,
     attachment_key,
     canonical_json,
+    env_flag,
     normalize_vault,
     parse_object,
 )
@@ -42,15 +43,13 @@ GOLDEN_AFTER_UPDATE = _SNAPSHOT_DIR / "vault_after_update.json"
 def _golden_enabled() -> bool:
     """Whether to compare/update golden snapshots this run.
 
-    The pinned-CLI matrix leg sets ``KP2BW_SNAPSHOT_GOLDEN=1`` and owns the
-    golden; the ``latest`` leg leaves it unset and runs behavioral + idempotency
+    The pinned-CLI matrix leg sets ``KP2BW_SNAPSHOT_GOLDEN`` truthy and owns the
+    golden; the ``latest`` leg sets it falsy and runs behavioral + idempotency
     checks only, so an upstream ``bw`` release that reshapes the JSON cannot
-    redden CI on its own.  ``KP2BW_UPDATE_SNAPSHOTS=1`` (regeneration) implies it.
+    redden CI on its own.  ``KP2BW_UPDATE_SNAPSHOTS`` (regeneration) implies it.
+    Both accept ``1``/``true``/``yes``/``on`` (see ``env_flag``).
     """
-    return (
-        os.environ.get("KP2BW_SNAPSHOT_GOLDEN") == "1"
-        or os.environ.get("KP2BW_UPDATE_SNAPSHOTS") == "1"
-    )
+    return env_flag("KP2BW_SNAPSHOT_GOLDEN") or env_flag("KP2BW_UPDATE_SNAPSHOTS")
 
 
 def _collect_sensitive_values(command: list[str]) -> tuple[str, ...]:

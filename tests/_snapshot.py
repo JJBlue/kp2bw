@@ -308,6 +308,12 @@ def normalize_vault(
 # --- golden comparison ------------------------------------------------------
 
 
+def env_flag(name: str) -> bool:
+    """Whether env var *name* is set to a truthy token (``1``/``true``/``yes``/``on``)."""
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def canonical_json(vault: NormVault) -> str:
     """Serialize a vault deterministically (sorted keys, UTF-8, ``\\n`` lines)."""
     return json.dumps(vault, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
@@ -316,7 +322,7 @@ def canonical_json(vault: NormVault) -> str:
 def assert_matches_golden(vault: NormVault, golden_path: Path) -> None:
     """Compare against the golden file, or rewrite it under ``KP2BW_UPDATE_SNAPSHOTS=1``."""
     actual = canonical_json(vault)
-    if os.environ.get("KP2BW_UPDATE_SNAPSHOTS") == "1":
+    if env_flag("KP2BW_UPDATE_SNAPSHOTS"):
         golden_path.parent.mkdir(parents=True, exist_ok=True)
         _ = golden_path.write_text(actual, encoding="utf-8", newline="\n")
         return

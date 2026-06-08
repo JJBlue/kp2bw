@@ -6,52 +6,43 @@ on:
   pull_request:
   push: { branches: [master] }
   workflow_dispatch:
-defaults: { run: { shell: bash } }
+defaults: { run: { shell: pwsh } }
 jobs:
-  # Single source of truth for the pinned Bitwarden CLI version: the root
-  # package.json (bumped by Dependabot's `bun` ecosystem). The golden snapshots
-  # are validated against exactly this version.
   config:
     runs-on: ubuntu-latest
     permissions: { contents: read }
-    outputs:
-      bw-pinned: ${{ steps.pin.outputs.version }}
+    outputs: { matrix: "${{ steps.pin.outputs.matrix }}" }
     steps:
       - uses: actions/checkout@v6.0.3
         with: { persist-credentials: false }
-      - id: pin
-        name: Resolve pinned @bitwarden/cli version
+      - name: Resolve pinned @bitwarden/cli version
+        id: pin
         run: |
-          version="$(jq -r '.devDependencies["@bitwarden/cli"] | ltrimstr("^") | ltrimstr("~")' package.json)"
-          # Validate before writing to GITHUB_OUTPUT: a hand-crafted package.json
-          # could otherwise inject newlines/extra outputs. The anchored pattern
-          # also rejects any embedded control characters.
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Unexpected @bitwarden/cli version in package.json: '$version'"
-            exit 1
-          fi
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-          echo "Pinned @bitwarden/cli: $version"
+          $spec = (gc package.json | ConvertFrom-Json).devDependencies.'@bitwarden/cli'
+          $version = $spec -replace '^[\^~]', ''
+          if ($version -notmatch '\A\d+\.\d+\.\d+([-.+][0-9A-Za-z.-]+)?\z') {
+          	write "::error::Unexpected @bitwarden/cli version in package.json: '$spec'"; exit 1
+          }
+          $matrix = @{
+          	include = @(
+          		@{ experimental = $false; 'bw-version' = $version }
+          		@{ experimental = $true; 'bw-version' = 'latest' }
+          	)
+          } | ConvertTo-Json -Compress -Depth 4
+          write "matrix=$matrix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          write "Matrix:"; $matrix | yq . -P
 
   e2e:
     needs: config
     runs-on: ubuntu-latest
     permissions: { contents: read }
     timeout-minutes: 15
-    # The `latest` leg is an informational canary: it runs behavioral +
-    # idempotency checks but cannot redden CI on its own (the golden is owned by
-    # the pinned leg, which is the hard gate).
     continue-on-error: ${{ matrix.experimental }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - bw-version: ${{ needs.config.outputs.bw-pinned }}
-            golden: "1"
-            experimental: false
-          - bw-version: latest
-            golden: "0"
-            experimental: true
+    env:
+      BW_SERVER_URL: https://localhost:18443
+      BW_CERT_PATH: ${{ github.workspace }}/tests/fixtures/vaultwarden-certs/cert.pem
+      KP2BW_SNAPSHOT_GOLDEN: ${{ !matrix.experimental }}
+    strategy: { fail-fast: false, matrix: "${{ fromJson(needs.config.outputs.matrix) }}" }
     steps:
       - uses: actions/checkout@v6.0.3
         with: { persist-credentials: false }
@@ -61,26 +52,27 @@ jobs:
 
       - name: Start Vaultwarden
         run: |
-          docker run -d --name vaultwarden -p 18443:443 \
-            -e I_REALLY_WANT_VOLATILE_STORAGE=true \
-            -e SIGNUPS_ALLOWED=false \
-            -e DOMAIN=https://localhost:18443 \
-            -e ROCKET_PORT=443 \
-            -e 'ROCKET_TLS={certs="/ssl/cert.pem",key="/ssl/key.pem"}' \
+          docker run -d --name vaultwarden -p 18443:443 `
+            -e I_REALLY_WANT_VOLATILE_STORAGE=true `
+            -e SIGNUPS_ALLOWED=false `
+            -e DOMAIN=$env:BW_SERVER_URL `
+            -e ROCKET_PORT=443 `
+            -e 'ROCKET_TLS={certs="/ssl/cert.pem",key="/ssl/key.pem"}' `
             kp2bw-vaultwarden
 
       - name: Wait for Vaultwarden
         run: |
-          for _ in $(seq 1 30); do
-            if curl -fsk https://localhost:18443/ >/dev/null 2>&1; then
-              echo "Vaultwarden is healthy"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::Vaultwarden did not become healthy"
-          docker logs vaultwarden
-          exit 1
+          curl --retry 30 --retry-connrefused --retry-delay 2 -fsk $env:BW_SERVER_URL | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            write @"
+          ::error::Vaultwarden did not become healthy
+          ::group::Vaultwarden logs
+          "@
+            docker logs vaultwarden
+            write ::endgroup::
+            exit 1
+          }
+          write "Vaultwarden is healthy"
 
       - uses: astral-sh/setup-uv@v8.2.0
       - run: uv sync --frozen
@@ -90,17 +82,15 @@ jobs:
         with: { version: "${{ matrix.bw-version }}" }
 
       - name: Run Vaultwarden end-to-end migration test
-        env:
-          BW_SERVER_URL: https://localhost:18443
-          BW_CERT_PATH: ${{ github.workspace }}/tests/fixtures/vaultwarden-certs/cert.pem
-          NODE_EXTRA_CA_CERTS: ${{ github.workspace }}/tests/fixtures/vaultwarden-certs/cert.pem
-          KP2BW_SNAPSHOT_GOLDEN: ${{ matrix.golden }}
-        run: uv run python tests/e2e_vaultwarden_test.py
+        run: uv run tests/e2e_vaultwarden_test.py
 
       - name: Show Vaultwarden logs on failure
         if: failure() || cancelled()
-        run: docker logs vaultwarden
+        run: |
+          write ::group::Vaultwarden` logs
+          docker logs vaultwarden
+          write ::endgroup::
 
       - name: Cleanup
         if: always()
-        run: docker rm -f vaultwarden || true
+        run: docker rm -f vaultwarden 2>$null; exit 0
