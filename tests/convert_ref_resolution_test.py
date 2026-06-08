@@ -7,7 +7,7 @@ from uuid import UUID
 from pykeepass import Entry, Group, PyKeePass, create_database
 
 from kp2bw.bw_types import BwItemCreate
-from kp2bw.convert import Converter, EntryValue
+from kp2bw.convert import MAX_BW_ITEM_LENGTH, Converter, EntryValue
 
 REFERENCE_ENTRY_UUID = UUID("12345678-1234-5678-1234-567812345678")
 REFERENCE_ENTRY_UUID_REF = REFERENCE_ENTRY_UUID.hex.upper()
@@ -282,6 +282,128 @@ def _run_chain_resolution(
         convert_logger.setLevel(previous_level)
 
 
+class _OversizeTestConverter(Converter):
+    """Converter exposing the offline load with attachments for oversize-field tests."""
+
+    def load_with_attachments(
+        self,
+    ) -> dict[str, tuple[BwItemCreate, set[str]]]:
+        """Load the KeePass DB offline; return each item with its attachment filenames.
+
+        Resolving filenames here (via the inherited ``_attachment_filename``)
+        keeps the protected-member access on ``self``, mirroring how the other
+        converter test doubles expose internals.
+        """
+        self._load_keepass_data()
+        return {
+            item["name"]: (
+                item,
+                {self._attachment_filename(att) for att in attachments},
+            )
+            for _, _, item, attachments in self._entries.values()
+        }
+
+
+def _run_oversize(
+    build: Callable[[PyKeePass, Group], None],
+    *,
+    include_oversize_secrets: bool,
+) -> tuple[dict[str, tuple[BwItemCreate, set[str]]], list[str]]:
+    """Build a temp KeePass DB, run the offline load, return items+attachments+warnings.
+
+    Mirrors :func:`_run_chain_resolution` but exposes attachment filenames and
+    the ``include_oversize_secrets`` toggle, and skips REF resolution (not
+    needed for these single-entry cases).
+    """
+    capture = _WarningCapture()
+    convert_logger = logging.getLogger("kp2bw.convert")
+    previous_level = convert_logger.level
+    convert_logger.addHandler(capture)
+    convert_logger.setLevel(logging.WARNING)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="kp2bw-oversize-") as tmp_dir:
+            db_path = str(Path(tmp_dir) / "oversize.kdbx")
+            kp = create_database(db_path, password="pw")
+            build(kp, kp.root_group)
+            kp.save()
+
+            converter = _OversizeTestConverter(
+                keepass_file_path=db_path,
+                keepass_password="pw",
+                keepass_keyfile_path=None,
+                bitwarden_password="pw",
+                bitwarden_organization_id=None,
+                bitwarden_coll_id=None,
+                path2name=False,
+                path2nameskip=1,
+                import_tags=None,
+                include_oversize_secrets=include_oversize_secrets,
+            )
+            return converter.load_with_attachments(), capture.messages
+    finally:
+        convert_logger.removeHandler(capture)
+        convert_logger.setLevel(previous_level)
+
+
+def assert_oversize_secret_field_is_not_lost_silently() -> None:
+    """An over-limit secret-class field is never silently dropped (#21 follow-up).
+
+    Covers both secret kinds that survive nowhere but a hidden inline field: a
+    hidden OTP secret (``HmacOtp-Secret``) and a KeePass-protected custom field.
+    Default: each is warned-and-dropped (not written to a plaintext attachment
+    without consent) while a non-secret over-limit field is offloaded to its
+    ``.txt`` attachment as usual. Opt-in (``--include-oversize-secrets``): each
+    secret is offloaded to its attachment too, so no data is lost.
+    """
+    big = "Z" * (MAX_BW_ITEM_LENGTH + 64)
+    secret_keys = ("HmacOtp-Secret", "protected_codes")
+
+    def build(kp: PyKeePass, root: Group) -> None:
+        """One entry with two over-limit secret-class fields beside a plain one."""
+        entry = kp.add_entry(root, "Big Secret", "user", "pw")
+        # HmacOtp-Secret: HOTP cannot migrate to Bitwarden's TOTP, so it would
+        # otherwise survive only as a hidden inline field -- over the limit it is
+        # dropped entirely, the data-loss edge under test.
+        entry.set_custom_property("HmacOtp-Secret", big)
+        # A KeePass-protected (Protected="True") field is a secret too, so it
+        # must be gated behind the opt-in -- never spilled to a plaintext
+        # attachment by default.
+        entry.set_custom_property("protected_codes", big, protect=True)
+        # Control: a non-secret over-limit field is always offloaded.
+        entry.set_custom_property("recovery_codes", big)
+
+    # Default: secrets dropped-with-warning, non-secret still offloaded.
+    items, warnings = _run_oversize(build, include_oversize_secrets=False)
+    item, att_names = items["Big Secret"]
+    if "recovery_codes.txt" not in att_names:
+        raise AssertionError("Non-secret over-limit field should always be offloaded")
+    for key in secret_keys:
+        if f"{key}.txt" in att_names:
+            raise AssertionError(f"Secret '{key}' was offloaded without opt-in")
+        if any(field["name"] == key for field in item["fields"]):
+            raise AssertionError(f"Over-limit secret '{key}' must not be stored inline")
+        if not any(key in w and "not migrated" in w for w in warnings):
+            raise AssertionError(
+                f"Expected a not-migrated warning for dropped '{key}', got {warnings}"
+            )
+
+    # Opt-in: each secret is recovered into its attachment, no data lost.
+    items, warnings = _run_oversize(build, include_oversize_secrets=True)
+    item, att_names = items["Big Secret"]
+    for key in secret_keys:
+        if f"{key}.txt" not in att_names:
+            raise AssertionError(
+                f"--include-oversize-secrets should offload secret '{key}'"
+            )
+        if any(field["name"] == key for field in item["fields"]):
+            raise AssertionError(f"Offloaded secret '{key}' must not also be inline")
+        if not any(key in w and "offloading" in w for w in warnings):
+            raise AssertionError(
+                f"Expected an offload warning for '{key}' under opt-in, got {warnings}"
+            )
+
+
 def assert_resolves_chain_with_merge() -> None:
     """``A -> B -> C`` with identical creds merges every URL onto one item.
 
@@ -421,6 +543,7 @@ def main() -> None:
     assert_resolves_chain_into_distinct_items()
     assert_reference_cycle_terminates()
     assert_malformed_reference_does_not_abort()
+    assert_oversize_secret_field_is_not_lost_silently()
     print("convert reference resolution test passed")
 
 
