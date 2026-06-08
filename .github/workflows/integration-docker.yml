@@ -23,7 +23,14 @@ jobs:
         name: Resolve pinned @bitwarden/cli version
         run: |
           version="$(jq -r '.devDependencies["@bitwarden/cli"] | ltrimstr("^") | ltrimstr("~")' package.json)"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Validate before writing to GITHUB_OUTPUT: a hand-crafted package.json
+          # could otherwise inject newlines/extra outputs. The anchored pattern
+          # also rejects any embedded control characters.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected @bitwarden/cli version in package.json: '$version'"
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           echo "Pinned @bitwarden/cli: $version"
 
   e2e:

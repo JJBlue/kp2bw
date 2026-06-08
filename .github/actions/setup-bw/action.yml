@@ -31,10 +31,22 @@ runs:
       run: |
         $requested = $env:BW_VERSION
 
-        if ([string]::IsNullOrWhiteSpace($requested) -or $requested -eq "latest") {
+        # Accept only an exact version or a known npm dist-tag. Anything else
+        # (git/url/file/tarball specs) is refused so a hostile `version` input
+        # cannot redirect the install to an arbitrary source.
+        if ([string]::IsNullOrWhiteSpace($requested)) {
         	$package = "@bitwarden/cli"
         } else {
-        	$package = "@bitwarden/cli@$($requested -replace '^v', '')"
+        	$normalized = $requested.Trim() -replace '^[vV]', ''
+        	$tag = $normalized.ToLowerInvariant()
+        	if ($tag -in @("latest", "beta", "canary", "next", "rc")) {
+        		$package = "@bitwarden/cli@$tag"
+        	} elseif ($normalized -match '^\d+\.\d+\.\d+([-+.][0-9A-Za-z.-]+)?$') {
+        		$package = "@bitwarden/cli@$normalized"
+        	} else {
+        		Write-Error "Refusing unsafe @bitwarden/cli version spec: '$requested'"
+        		exit 1
+        	}
         }
 
         $cacheRoot = if ($env:RUNNER_TOOL_CACHE) {
