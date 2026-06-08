@@ -8,6 +8,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-06-08
+
 ### Added
 
 - **Reproducible snapshot-backed Vaultwarden e2e suite** (#20) -- the
@@ -509,7 +511,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 [`jampe/kp2bw@c9ef571eabd345db94751f7dec845e49756e9d47`](https://github.com/jampe/kp2bw/commit/c9ef571eabd345db94751f7dec845e49756e9d47)
 
-[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.3.0...HEAD
+[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.4.0...HEAD
+[3.4.0]: https://github.com/kjanat/kp2bw/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/kjanat/kp2bw/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/kjanat/kp2bw/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/kjanat/kp2bw/compare/v3.0.1...v3.1.0
