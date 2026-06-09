@@ -16,8 +16,10 @@ from types import FrameType, TracebackType
 from typing import Any, Self, cast
 
 import httpx
+from rich.markup import escape
 
 from . import VERBOSE
+from ._console import console
 from .bw_types import BwCollection, BwFolder, BwItemCreate, BwItemResponse
 from .exceptions import BitwardenClientError
 
@@ -103,9 +105,31 @@ BW_NOT_FOUND_MSG: str = (
 BW_LOGIN_COMPAT_HINT: str = (
     "If you cannot log in at all -- e.g. `bw login` returns HTTP 404 on "
     "/identity/accounts/prelogin/password -- your self-hosted server is likely "
-    "older than your `bw` CLI. See TROUBLESHOOTING.md "
-    '("Login fails with a 404") for the server/CLI compatibility cutoff.'
+    "older than your `bw` CLI."
 )
+
+# Deep link to the matching TROUBLESHOOTING.md section (GitHub heading anchor).
+TROUBLESHOOTING_LOGIN_404_URL: str = (
+    "https://github.com/kjanat/kp2bw/blob/master/TROUBLESHOOTING.md"
+    "#login-fails-with-a-404-self-hosted-server-too-old-for-your-bw-cli"
+)
+
+
+def warn_login_compatibility() -> None:
+    """Print the login-compat hint to the console as a clickable link.
+
+    Deliberately routed through the shared Rich console rather than ``logger``:
+    Rich renders the URL as an OSC 8 hyperlink where the terminal supports it
+    and degrades to plain text otherwise, so the clickable form never leaks
+    escape codes into the always-on debug log file (which already records the
+    bare unlock failure). The URL is both the ``[link]`` target *and* the
+    visible text, so a legacy console or a redirected stream still shows the
+    address -- only the clickability is lost.
+    """
+    url = TROUBLESHOOTING_LOGIN_404_URL
+    console.print(
+        f"[yellow]{escape(BW_LOGIN_COMPAT_HINT)}[/yellow] See [link={url}]{url}[/link]"
+    )
 
 
 def _is_missing_item_error(status_code: int, message: object) -> bool:
@@ -540,7 +564,7 @@ class BitwardenServeClient:
             if stderr_text:
                 message += f"; stderr: {stderr_text}"
             logger.warning(message)
-            logger.warning(BW_LOGIN_COMPAT_HINT)
+            warn_login_compatibility()
             return None
         session = result.stdout.strip()
         if session:

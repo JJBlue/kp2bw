@@ -240,6 +240,44 @@ def assert_send_with_retry_exhaustion_raises_project_error() -> None:
         raise AssertionError("exhausted retries must raise BitwardenClientError")
 
 
+def assert_login_compat_hint_renders_osc8() -> None:
+    """``warn_login_compatibility`` prints a clickable OSC 8 link on a terminal.
+
+    ``legacy_windows=False`` is required: Rich strips hyperlinks on the legacy
+    Windows console, so without it the link silently degrades even on a forced
+    terminal. The shared module console is patched so the public entry point
+    renders into a capturable terminal.
+    """
+    from rich.console import Console
+
+    term = Console(force_terminal=True, legacy_windows=False, width=200)
+    with patch.object(bw_serve, "console", term), term.capture() as cap:
+        bw_serve.warn_login_compatibility()
+    out = cap.get()
+    if "\x1b]8;" not in out:
+        raise AssertionError(f"expected an OSC 8 hyperlink escape, got {out!r}")
+    if bw_serve.TROUBLESHOOTING_LOGIN_404_URL not in out:
+        raise AssertionError("troubleshooting URL missing from the OSC 8 sequence")
+
+
+def assert_login_compat_hint_degrades_to_plain_url() -> None:
+    """Without OSC 8 support the URL survives as plain, copyable text.
+
+    A non-terminal sink (pipe/redirect) gets no hyperlink escape, so the URL
+    must be the visible link text -- otherwise the address would be lost.
+    """
+    from rich.console import Console
+
+    plain = Console(force_terminal=False, width=200)
+    with patch.object(bw_serve, "console", plain), plain.capture() as cap:
+        bw_serve.warn_login_compatibility()
+    out = cap.get()
+    if "\x1b]8;" in out:
+        raise AssertionError(f"non-terminal output must carry no OSC 8 escape: {out!r}")
+    if bw_serve.TROUBLESHOOTING_LOGIN_404_URL not in out:
+        raise AssertionError(f"URL must remain visible as plain text, got {out!r}")
+
+
 def main() -> None:
     assert_resolve_plain_on_posix()
     assert_resolve_windows_exe_direct()
@@ -254,6 +292,8 @@ def main() -> None:
     assert_send_with_retry_recovers_idempotent()
     assert_send_with_retry_does_not_retry_post()
     assert_send_with_retry_exhaustion_raises_project_error()
+    assert_login_compat_hint_renders_osc8()
+    assert_login_compat_hint_degrades_to_plain_url()
     print("bw serve command resolution test passed")
 
 
