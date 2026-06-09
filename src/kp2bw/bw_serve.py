@@ -182,45 +182,110 @@ def resolve_bw_command() -> tuple[list[str], str | None]:
     return [path], None
 
 
-def terminate_serve(
-    process: subprocess.Popen[bytes],
-    *,
-    via_shell: bool = False,
-    timeout: float = 5.0,
-) -> None:
-    """Stop a running ``bw serve`` process together with its descendants.
+def parse_listening_pids(netstat_output: str, port: int) -> set[int]:
+    """Extract PIDs ``LISTENING`` on ``127.0.0.1:port`` from ``netstat -ano`` output.
 
-    When ``bw`` is launched through a Windows shim wrapper (``cmd.exe`` for a
-    ``bw.cmd``/``bw.bat``, or PowerShell for a ``bw.ps1``),
-    :meth:`subprocess.Popen.terminate` reaches only the wrapper and orphans the
-    real ``bw serve``, which keeps holding the port. In that case the whole
-    process tree is killed with ``taskkill /F /T`` instead.
+    Split out from :func:`_listening_pids` so the (fiddly, column-based) parsing
+    is unit-testable without spawning a real listener.  A ``netstat`` row looks
+    like ``TCP  127.0.0.1:45707  0.0.0.0:0  LISTENING  1234``.
     """
-    if process.poll() is not None:
-        return
-    if via_shell and os.name == "nt":
-        # terminate() would only kill the cmd.exe wrapper; take down the tree.
+    needle = f"127.0.0.1:{port}"
+    pids: set[int] = set()
+    for line in netstat_output.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[1] == needle and parts[3] == "LISTENING":
+            try:
+                pids.add(int(parts[4]))
+            except ValueError:
+                continue
+    return pids
+
+
+def _listening_pids(port: int) -> set[int]:
+    """Return PIDs ``LISTENING`` on ``127.0.0.1:port`` (Windows, via ``netstat``).
+
+    Best-effort: any failure yields an empty set so teardown never raises.
+    """
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return parse_listening_pids(result.stdout, port)
+
+
+def _kill_port_listeners(port: int) -> None:
+    """Force-kill any process still ``LISTENING`` on ``127.0.0.1:port`` (Windows).
+
+    The reliable orphan reaper: regardless of how the ``bw serve`` process tree
+    is shaped, or whether the wrapper we tracked already exited, whatever still
+    holds the serve port is the orphan to kill.  Best-effort; a kill failure is
+    logged, not raised, since this runs during teardown.
+    """
+    for pid in _listening_pids(port):
         _ = subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            ["taskkill", "/F", "/PID", str(pid)],
             check=False,
             capture_output=True,
             stdin=subprocess.DEVNULL,
         )
-        try:
-            _ = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            logger.warning("bw serve did not exit after taskkill /T")
-        return
-    process.terminate()
-    try:
-        _ = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        logger.warning("bw serve did not exit on SIGTERM, sending SIGKILL")
-        process.kill()
-        try:
-            _ = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            logger.warning("bw serve did not exit after SIGKILL")
+        logger.warning(f"Reaped orphaned bw serve process {pid} holding port {port}")
+
+
+def terminate_serve(
+    process: subprocess.Popen[bytes],
+    *,
+    via_shell: bool = False,
+    port: int | None = None,
+    timeout: float = 5.0,
+) -> None:
+    """Stop a running ``bw serve`` together with its descendants.
+
+    On Windows a shim-launched ``bw serve`` runs as a *grandchild* (``cmd.exe``
+    wrapper → ``node`` → ``node`` worker, or PowerShell for a ``.ps1``).  Killing
+    only the wrapper — or finding it already exited and bailing — orphans the
+    worker, which keeps holding the port; and because every ``bw`` invocation
+    shares one app-data store, accumulated orphans can deadlock later runs.
+    Teardown is therefore belt-and-suspenders: take down the tracked process
+    tree, then (Windows) reap anything still ``LISTENING`` on *port*, which
+    catches a worker that outlived or re-parented away from its wrapper.
+    """
+    if process.poll() is None:
+        if via_shell and os.name == "nt":
+            # terminate() would reach only the cmd.exe wrapper; take the tree.
+            _ = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+            )
+            try:
+                _ = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning("bw serve did not exit after taskkill /T")
+        else:
+            process.terminate()
+            try:
+                _ = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning("bw serve did not exit on SIGTERM, sending SIGKILL")
+                process.kill()
+                try:
+                    _ = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    logger.warning("bw serve did not exit after SIGKILL")
+
+    # Windows: reap a shim worker that survived (or re-parented away from) the
+    # wrapper we tracked — including the case where the wrapper had already
+    # exited, which the old early-return missed, leaving an orphan on the port.
+    if os.name == "nt" and port is not None:
+        _kill_port_listeners(port)
 
 
 def sanitize_cli_output(
@@ -501,9 +566,14 @@ class BitwardenServeClient:
         if self._previous_sigint is not None:
             signal.signal(signal.SIGINT, self._previous_sigint)
 
-        if self._process is not None and self._process.poll() is None:
+        # Call teardown unconditionally (not gated on poll()): on Windows the
+        # tracked wrapper can exit while its node worker lives on, so the
+        # port-based reap inside terminate_serve must run even then.
+        if self._process is not None:
             logger.log(VERBOSE, "Terminating bw serve process")
-            terminate_serve(self._process, via_shell=self._bw_via_shell)
+            terminate_serve(
+                self._process, via_shell=self._bw_via_shell, port=self._port
+            )
 
         self._process = None
         try:

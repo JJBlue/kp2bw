@@ -144,6 +144,43 @@ def assert_terminate_serve_noop_when_already_dead() -> None:
     terminate_serve(proc, via_shell=True, timeout=5)
 
 
+def assert_parse_listening_pids_extracts_owner() -> None:
+    """Only the LISTENING owner of the exact port is extracted."""
+    output = (
+        "\n  Proto  Local Address      Foreign Address    State        PID\n"
+        "  TCP    127.0.0.1:22650    0.0.0.0:0          LISTENING    4242\n"
+        "  TCP    127.0.0.1:139      0.0.0.0:0          LISTENING    4\n"
+        "  TCP    127.0.0.1:22650    127.0.0.1:51000    ESTABLISHED  9999\n"
+        "  TCP    0.0.0.0:445        0.0.0.0:0          LISTENING    4\n"
+    )
+    pids = bw_serve.parse_listening_pids(output, 22650)
+    if pids != {4242}:
+        raise AssertionError(f"expected {{4242}} for the listener, got {pids!r}")
+    # An ESTABLISHED connection on the port is not a listener; a free port yields none.
+    if bw_serve.parse_listening_pids(output, 51000) != set():
+        raise AssertionError("must not match a foreign-address port column")
+    if bw_serve.parse_listening_pids(output, 12345) != set():
+        raise AssertionError("unused port should yield no pids")
+
+
+def assert_terminate_serve_reaps_port_when_wrapper_dead() -> None:
+    """The regression: wrapper already exited, worker still holds the port.
+
+    terminate_serve must still reap by port on Windows even when the tracked
+    process is already dead -- the case the old early-return missed.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    _ = proc.wait(timeout=5)
+    reaped: list[int] = []
+    with (
+        patch.object(bw_serve.os, "name", "nt"),
+        patch.object(bw_serve, "_kill_port_listeners", reaped.append),
+    ):
+        terminate_serve(proc, via_shell=True, port=22650, timeout=5)
+    if reaped != [22650]:
+        raise AssertionError(f"expected port 22650 to be reaped, got {reaped!r}")
+
+
 def main() -> None:
     assert_resolve_plain_on_posix()
     assert_resolve_windows_exe_direct()
@@ -153,6 +190,8 @@ def main() -> None:
     assert_resolve_missing_raises_windows()
     assert_terminate_serve_kills_process()
     assert_terminate_serve_noop_when_already_dead()
+    assert_parse_listening_pids_extracts_owner()
+    assert_terminate_serve_reaps_port_when_wrapper_dead()
     print("bw serve command resolution test passed")
 
 
