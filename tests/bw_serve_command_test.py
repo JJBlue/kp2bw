@@ -10,8 +10,15 @@ import sys
 from collections.abc import Callable, Mapping
 from unittest.mock import patch
 
+import httpx
+
 from kp2bw import bw_serve
-from kp2bw.bw_serve import BW_NOT_FOUND_MSG, resolve_bw_command, terminate_serve
+from kp2bw.bw_serve import (
+    BW_NOT_FOUND_MSG,
+    resolve_bw_command,
+    send_with_retry,
+    terminate_serve,
+)
 from kp2bw.exceptions import BitwardenClientError
 
 
@@ -181,6 +188,58 @@ def assert_terminate_serve_reaps_port_when_wrapper_dead() -> None:
         raise AssertionError(f"expected port 22650 to be reaped, got {reaped!r}")
 
 
+def assert_send_with_retry_recovers_idempotent() -> None:
+    """A transient transport error on an idempotent request is retried away."""
+    calls = {"n": 0}
+    ok = httpx.Response(200)
+
+    def send() -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadError("forcibly closed")
+        return ok
+
+    got = send_with_retry(
+        send, method="PUT", path="/x", max_attempts=3, sleep=lambda _s: None
+    )
+    if got is not ok or calls["n"] != 3:
+        raise AssertionError(f"idempotent retry should recover; calls={calls['n']}")
+
+
+def assert_send_with_retry_does_not_retry_post() -> None:
+    """A non-idempotent POST is attempted once and not retried (no dup risk)."""
+    calls = {"n": 0}
+
+    def send() -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadError("forcibly closed")
+
+    try:
+        send_with_retry(send, method="POST", path="/x", sleep=lambda _s: None)
+    except BitwardenClientError:
+        pass
+    else:
+        raise AssertionError("POST transport error must raise, not silently retry")
+    if calls["n"] != 1:
+        raise AssertionError(f"POST must be attempted exactly once, got {calls['n']}")
+
+
+def assert_send_with_retry_exhaustion_raises_project_error() -> None:
+    """Exhausted retries surface a BitwardenClientError, not a raw httpx error."""
+
+    def send() -> httpx.Response:
+        raise httpx.ReadError("forcibly closed")
+
+    try:
+        send_with_retry(
+            send, method="GET", path="/x", max_attempts=2, sleep=lambda _s: None
+        )
+    except BitwardenClientError:
+        pass
+    else:
+        raise AssertionError("exhausted retries must raise BitwardenClientError")
+
+
 def main() -> None:
     assert_resolve_plain_on_posix()
     assert_resolve_windows_exe_direct()
@@ -192,6 +251,9 @@ def main() -> None:
     assert_terminate_serve_noop_when_already_dead()
     assert_parse_listening_pids_extracts_owner()
     assert_terminate_serve_reaps_port_when_wrapper_dead()
+    assert_send_with_retry_recovers_idempotent()
+    assert_send_with_retry_does_not_retry_post()
+    assert_send_with_retry_exhaustion_raises_project_error()
     print("bw serve command resolution test passed")
 
 

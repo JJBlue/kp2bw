@@ -35,6 +35,20 @@ _HTTP_TIMEOUT_S: float = 60.0
 # Max length for sanitized CLI output snippets in logs/errors.
 _SANITIZED_OUTPUT_MAX_CHARS: int = 240
 
+# bw serve occasionally drops a pooled keepalive connection over a long
+# migration (a localhost reset, e.g. WinError 10054). Idempotent requests are
+# retried on such a transport error; non-idempotent ones (POST) are not, since a
+# reset could hide an item the server already created.
+_REQUEST_MAX_ATTEMPTS: int = 3
+_REQUEST_RETRY_BACKOFF_S: float = 0.5
+_IDEMPOTENT_METHODS: frozenset[str] = frozenset({
+    "GET",
+    "PUT",
+    "DELETE",
+    "HEAD",
+    "OPTIONS",
+})
+
 # Response-only keys returned by ``GET``/``list`` that must never be sent back in
 # a ``PUT`` body: the API expects a create-shaped object (``BwItemCreate``), and
 # echoing server-managed fields (notably ``attachments``) risks rejection or
@@ -338,6 +352,45 @@ def format_http_error(resp: httpx.Response) -> str:
     return sanitize_cli_output(text) if text.strip() else "(empty response body)"
 
 
+def send_with_retry(
+    send: Callable[[], httpx.Response],
+    *,
+    method: str,
+    path: str,
+    max_attempts: int = _REQUEST_MAX_ATTEMPTS,
+    backoff_s: float = _REQUEST_RETRY_BACKOFF_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> httpx.Response:
+    """Call *send*, retrying transient transport errors for idempotent methods.
+
+    ``bw serve`` can drop a pooled keepalive connection over a long run; httpx
+    surfaces that as :class:`httpx.TransportError` before the request is
+    processed, so retrying an idempotent method (GET/PUT/DELETE) on a fresh
+    connection recovers without risking a duplicate.  A non-idempotent ``POST``
+    is attempted once.  A persistent failure is raised as a
+    :class:`BitwardenClientError` so callers see a project error (and per-entry
+    handlers can treat it as non-fatal) rather than a raw ``httpx`` traceback
+    that aborts the whole migration.  *sleep* is injectable for tests.
+    """
+    attempts = max_attempts if method.upper() in _IDEMPOTENT_METHODS else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return send()
+        except httpx.TransportError as exc:
+            if attempt < attempts:
+                logger.warning(
+                    f"bw serve {method} {path}: transport error ({exc}); "
+                    f"retrying ({attempt}/{attempts - 1})"
+                )
+                sleep(backoff_s * attempt)
+                continue
+            raise BitwardenClientError(
+                f"bw serve {method} {path} failed after {attempt} attempt(s): {exc}"
+            ) from exc
+    # The loop always returns or raises above; this satisfies the type checker.
+    raise BitwardenClientError(f"bw serve {method} {path}: no attempt was made")
+
+
 def _find_free_port() -> int:
     """Find an available TCP port on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -617,11 +670,10 @@ class BitwardenServeClient:
         Raises :class:`BitwardenClientError` on non-success responses or
         when the ``bw serve`` JSON envelope reports ``success: false``.
         """
-        resp = self._http.request(
-            method,
-            path,
-            json=json_body,
-            params=params,
+        resp = send_with_retry(
+            lambda: self._http.request(method, path, json=json_body, params=params),
+            method=method,
+            path=path,
         )
         if resp.status_code >= 400:
             raise BitwardenClientError(
