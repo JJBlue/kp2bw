@@ -81,8 +81,9 @@ src/kp2bw/
   `Converter(include_oversize_secrets=...)`, default off) opts into offloading
   those secrets to their attachment too.
 - Dedup keys on a **stable identity**, not `(folder, title)`. Every migrated
-  item carries a hidden `KP2BW_ID` custom field holding the source KeePass entry
-  UUID (stamped in `_add_bw_entry_to_entries_dict`, read by
+  item carries a plain-text `KP2BW_ID` custom field holding the source KeePass
+  entry UUID (an identifier, not a secret — hence text, not hidden; stamped in
+  `_add_bw_entry_to_entries_dict`, read by
   `bw_serve.item_kp2bw_id`, and excluded from `_fields_signature` so it never
   triggers a spurious update). `_build_dedup_index()` builds `_by_uuid` (stamped
   items) plus `_legacy_by_folder_name` (unstamped **login** items only).
@@ -92,6 +93,16 @@ src/kp2bw/
   This stops distinct same-titled entries from collapsing onto one item (data
   loss) and keeps re-runs idempotent across title/folder edits. The legacy
   adoption is a one-time path for vaults imported before stable identity.
+- `--metadata` (default on) folds the KeePass metadata Bitwarden has no native
+  slot for — **tags and expiry** — into a single readable **YAML** `KP2BW_META`
+  text field (`_build_metadata_field`, via PyYAML `safe_dump(allow_unicode=
+  False)` so control chars and the U+0085/2028/2029 line-break code points are
+  escaped, not silently corrupted), omitted when an entry has neither (so most
+  items get no metadata field at all). `Created`/`Modified` timestamps are
+  **not** migrated: Bitwarden manages its own creation/revision dates and the
+  API cannot backdate them (a client-supplied `creationDate` is ignored on
+  create and rejected on update), so the originals had no native home and were
+  dropped rather than clutter every item.
 - Dedup is org-scoped when `--bitwarden-org` is set and collection-scoped when a
   fixed `--bitwarden-collection` is given: `_build_dedup_index()` /
   `list_items()` pass `organization_id` / `collection_id`. Personal vault

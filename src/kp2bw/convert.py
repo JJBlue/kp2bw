@@ -6,6 +6,7 @@ import time
 from itertools import islice
 from typing import Literal
 
+import yaml
 from pykeepass import Attachment, Entry, Group, PyKeePass
 from rich.progress import (
     BarColumn,
@@ -39,6 +40,11 @@ KPEX_PASSKEY_PREFIX: str = "KPEX_PASSKEY_"
 # Bitwarden item type for login entries (1=login, 2=secureNote, 3=card,
 # 4=identity).  kp2bw only ever creates and content-syncs login items.
 BW_ITEM_TYPE_LOGIN: int = 1
+
+# Single custom field holding KeePass metadata Bitwarden has no native slot for
+# (tags, expiry) as readable YAML. Folds what used to be several rows into one,
+# and is omitted entirely when an entry has no such metadata.
+KP2BW_META_FIELD_NAME: str = "KP2BW_META"
 
 # Attachment-like: real pykeepass Attachment or (key, value) tuple for long fields
 type AttachmentItem = Attachment | tuple[str, str]
@@ -293,25 +299,34 @@ class Converter:
             group = group.parentgroup
         return False
 
-    def _build_metadata_fields(self, entry: Entry) -> dict[str, FieldSpec]:
-        """Build extra custom fields for KeePass metadata (tags, expiry, timestamps)."""
-        fields: dict[str, FieldSpec] = {}
+    def _build_metadata_field(self, entry: Entry) -> FieldSpec | None:
+        """Build the single ``KP2BW_META`` field for KeePass metadata, as YAML.
 
-        # Tags
-        if entry.tags:
-            fields["KeePass Tags"] = (", ".join(entry.tags), 0)
+        Carries only the metadata Bitwarden has no native slot for and that we
+        keep -- tags and expiry -- as readable YAML.  KeePass ``Created``/
+        ``Modified`` timestamps are intentionally dropped: Bitwarden manages its
+        own creation/revision dates (which the API cannot backdate), so the
+        originals had no native home.  Returns ``None`` when the entry has
+        neither tags nor an expiry, so most items get no metadata field at all.
 
-        # Expiry
+        Serialised with PyYAML's ``safe_dump`` at ``allow_unicode=False`` so
+        every value is escaped correctly -- including control characters and the
+        YAML line-break code points (U+0085/U+2028/U+2029) that a hand-rolled
+        emitter silently corrupts.  Non-ASCII is escaped (e.g. ``"caf\\xE9"``) as
+        the price of that guarantee.  Sorted keys + KeePass tag order make the
+        output byte-stable for idempotent re-runs.
+        """
+        meta: dict[str, object] = {}
         if entry.expires and entry.expiry_time:
-            fields["Expires"] = (entry.expiry_time.isoformat(), 0)
-
-        # Timestamps
-        if entry.ctime:
-            fields["Created"] = (entry.ctime.isoformat(), 0)
-        if entry.mtime:
-            fields["Modified"] = (entry.mtime.isoformat(), 0)
-
-        return fields
+            meta["expires"] = entry.expiry_time.isoformat()
+        if entry.tags:
+            meta["tags"] = list(entry.tags)
+        if not meta:
+            return None
+        text: str = yaml.safe_dump(
+            meta, default_flow_style=False, allow_unicode=False, sort_keys=True
+        ).rstrip("\n")
+        return (text, 0)
 
     def _add_bw_entry_to_entries_dict(
         self, entry: Entry, custom_protected: list[str] | None
@@ -352,17 +367,21 @@ class Converter:
             else:
                 custom_properties[key] = (value, 0)
 
-        # Add metadata fields (tags, expiry, timestamps) if enabled
+        # Fold KeePass metadata (tags, expiry) into one KP2BW_META JSON field
+        # when enabled; omitted on entries with neither, so most items stay clean.
         if self._migrate_metadata:
-            custom_properties.update(self._build_metadata_fields(entry))
+            meta_field = self._build_metadata_field(entry)
+            if meta_field is not None:
+                custom_properties[KP2BW_META_FIELD_NAME] = meta_field
 
         # Stamp the stable identity marker — always, independent of --metadata.
-        # It carries the source KeePass entry UUID as a hidden field so dedup
-        # keys on it instead of the mutable (folder, title); see
-        # bw_serve.item_kp2bw_id / _build_dedup_index. Excluded from the content
-        # diff (_fields_signature) so it never makes a re-run look "changed".
+        # A plain-text field carrying the source KeePass entry UUID so dedup keys
+        # on it instead of the mutable (folder, title); see bw_serve.item_kp2bw_id
+        # / _build_dedup_index. Excluded from the content diff (_fields_signature)
+        # so it never makes a re-run look "changed". Text, not hidden: it is an
+        # identifier, not a secret.
         entry_uuid = str(entry.uuid).replace("-", "").upper()
-        custom_properties[KP2BW_ID_FIELD_NAME] = (entry_uuid, 1)
+        custom_properties[KP2BW_ID_FIELD_NAME] = (entry_uuid, 0)
 
         # Build FIDO2/passkey credentials from KeePassXC attributes
         fido2_credentials = self._build_fido2_credentials(entry)

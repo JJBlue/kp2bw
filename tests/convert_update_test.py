@@ -8,11 +8,12 @@ Protected members are exercised through a ``Converter`` subclass (mirroring
 ``convert_ref_resolution_test``) so the checks stay type-clean.
 """
 
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from kp2bw.bw_serve import BitwardenServeClient
 from kp2bw.bw_types import BwItemCreate, BwItemResponse, BwUri
-from kp2bw.convert import AttachmentItem, Converter
+from kp2bw.convert import AttachmentItem, Converter, FieldSpec
 from kp2bw.exceptions import BitwardenClientError
 
 
@@ -71,6 +72,10 @@ class UpdateTestConverter(Converter):
             kp_uuid=kp_uuid,
             force_update=force_update,
         )
+
+    def meta_field(self, entry: object) -> FieldSpec | None:
+        """Public shim for the KP2BW_META metadata-field builder."""
+        return self._build_metadata_field(cast(Any, entry))
 
 
 def _make_existing(**over: Any) -> BwItemResponse:
@@ -555,6 +560,48 @@ def assert_no_update_skips_forced_stamp() -> None:
         raise AssertionError("--no-update must not PUT even when adoption forces it")
 
 
+class _FakeEntry:
+    """Minimal stand-in exposing the attributes _build_metadata_field reads."""
+
+    def __init__(
+        self,
+        *,
+        tags: list[str] | None = None,
+        expires: bool = False,
+        expiry_time: datetime | None = None,
+    ) -> None:
+        self.tags = tags
+        self.expires = expires
+        self.expiry_time = expiry_time
+
+
+def assert_metadata_field_folds_tags_and_expiry() -> None:
+    conv = UpdateTestConverter()
+    spec = conv.meta_field(
+        _FakeEntry(
+            tags=["b", "a"],
+            expires=True,
+            expiry_time=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+    )
+    if spec is None:
+        raise AssertionError("tagged/expiring entry should produce a KP2BW_META field")
+    value, ftype = spec
+    if ftype != 0:
+        raise AssertionError(f"KP2BW_META must be a text field (type 0), got {ftype}")
+    # Readable YAML, byte-stable (sorted keys, KeePass tag order) so an unchanged
+    # re-run never looks "changed".
+    expected = "expires: '2025-01-01T00:00:00+00:00'\ntags:\n- b\n- a"
+    if value != expected:
+        raise AssertionError(f"KP2BW_META YAML not as expected: {value!r}")
+
+
+def assert_metadata_field_none_without_tags_or_expiry() -> None:
+    conv = UpdateTestConverter()
+    if conv.meta_field(_FakeEntry()) is not None:
+        raise AssertionError("entry with no tags/expiry must yield no metadata field")
+
+
 def main() -> None:
     """Run the script-style assertions and report success."""
     assert_identical_content_is_idempotent()
@@ -578,6 +625,8 @@ def main() -> None:
     assert_non_login_collision_is_not_mutated()
     assert_adoption_forces_stamp_put()
     assert_no_update_skips_forced_stamp()
+    assert_metadata_field_folds_tags_and_expiry()
+    assert_metadata_field_none_without_tags_or_expiry()
     print("convert update test passed")
 
 

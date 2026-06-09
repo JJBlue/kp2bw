@@ -15,7 +15,12 @@ classifiers     = [
   "Topic :: Utilities",
   "Typing :: Typed",
 ]
-dependencies    = ["httpx>=0.28.0", "pykeepass>=4.1.1.post1", "rich>=13.0.0"]
+dependencies    = [
+    "httpx>=0.28.0",
+    "pykeepass>=4.1.1.post1",
+    "pyyaml>=6.0.3",
+    "rich>=13.0.0",
+]
 
 [[project.authors]]
 name  = "Kaj Kowalski"
@@ -35,6 +40,7 @@ dev     = [
   { include-group = "lint" },
   { include-group = "stubs" },
   { include-group = "test" },
+  "types-pyyaml>=6.0.12.20260518",
 ]
 codegen = ["datamodel-code-generator[ruff]>=0.31"]
 lint    = [
