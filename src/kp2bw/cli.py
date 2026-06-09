@@ -3,6 +3,8 @@ import logging
 import os
 import sys
 from argparse import ArgumentParser, BooleanOptionalAction, Namespace
+from datetime import datetime
+from pathlib import Path
 from typing import NoReturn
 
 from rich.logging import RichHandler
@@ -13,6 +15,8 @@ from ._console import console
 from .bw_serve import ensure_bw_available
 from .convert import Converter
 from .exceptions import BitwardenClientError, ConversionError
+
+logger = logging.getLogger(__name__)
 
 
 class MyArgParser(ArgumentParser):
@@ -227,6 +231,101 @@ def _fail(exc: BaseException) -> NoReturn:
     sys.exit(1)
 
 
+# Third-party loggers whose INFO/DEBUG chatter is valuable in the file log but
+# noise on the console; the file handler keeps everything, the console handler
+# drops them below WARNING unless --debug asks for the full firehose.
+_NOISY_LOGGERS: frozenset[str] = frozenset({"httpx", "httpcore"})
+
+
+class _ConsoleNoiseFilter(logging.Filter):
+    """Drop third-party sub-WARNING records from the console handler only."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        root_name = record.name.split(".", 1)[0]
+        return not (root_name in _NOISY_LOGGERS and record.levelno < logging.WARNING)
+
+
+def _resolve_log_path() -> Path:
+    """Return the file path for this run's debug log.
+
+    ``KP2BW_LOG_FILE`` overrides everything; otherwise ``KP2BW_LOG_DIR`` or a
+    per-user, platform-appropriate location holds one timestamped file per run.
+    """
+    explicit = os.environ.get("KP2BW_LOG_FILE")
+    if explicit:
+        return Path(explicit)
+
+    override_dir = os.environ.get("KP2BW_LOG_DIR")
+    if override_dir:
+        log_dir = Path(override_dir)
+    elif os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        log_dir = Path(base) / "kp2bw" / "logs"
+    elif sys.platform == "darwin":
+        log_dir = Path.home() / "Library" / "Logs" / "kp2bw"
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "state"
+        )
+        log_dir = Path(base) / "kp2bw" / "logs"
+
+    # Local-time stamp for a human-friendly filename; .astimezone() makes it
+    # tz-aware (naive datetime.now() is flagged as ambiguous).
+    return log_dir / f"kp2bw-{datetime.now().astimezone():%Y%m%d-%H%M%S}.log"
+
+
+def _configure_logging(*, verbose: bool, debug: bool) -> Path | None:
+    """Configure console + always-on file logging; return the log path.
+
+    Console verbosity follows the flags (INFO default, VERBOSE with ``-v``, full
+    DEBUG with ``-d``).  A file handler is *always* attached at DEBUG so a
+    complete trace -- per-entry detail plus one line per HTTP request -- is
+    captured regardless of console verbosity.  Returns ``None`` when the log file
+    cannot be opened, so a logging-setup failure never aborts a migration.
+    """
+    root = logging.getLogger()
+    # Clean slate so a second main() invocation (e.g. in tests) does not stack
+    # duplicate handlers.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.setLevel(logging.DEBUG)
+
+    if debug:
+        console_handler: logging.Handler = logging.StreamHandler()
+        console_handler.setFormatter(
+            logging.Formatter("%(levelname)s: %(name)s: %(message)s")
+        )
+        console_handler.setLevel(logging.DEBUG)
+        logging.getLogger("httpx").setLevel(logging.DEBUG)
+        logging.getLogger("httpcore").setLevel(logging.INFO)
+    else:
+        console_handler = RichHandler(
+            console=console, show_path=False, markup=False, log_time_format="[%X]"
+        )
+        console_handler.setLevel(VERBOSE if verbose else logging.INFO)
+        console_handler.addFilter(_ConsoleNoiseFilter())
+        # One INFO line per HTTP request reaches the file (useful for timing and
+        # tracing) while the console filter above keeps it quiet.
+        logging.getLogger("httpx").setLevel(logging.INFO)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+    root.addHandler(console_handler)
+
+    try:
+        log_path = _resolve_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+        )
+        root.addHandler(file_handler)
+    except OSError as exc:
+        logger.warning(f"Could not open log file; continuing without one ({exc})")
+        return None
+
+    return log_path
+
+
 def main() -> None:
     """Entry point: parse arguments, resolve env vars, and run the converter."""
     args: Namespace = _argparser().parse_args()
@@ -346,23 +445,13 @@ def main() -> None:
         sys.exit(2)
 
     # logging
-    #   default : INFO via RichHandler  — httpx silenced, progress bar active
-    #   -v      : VERBOSE for kp2bw     — httpx silenced, per-entry detail shown
-    #   -d      : DEBUG for everything  — raw format, httpx included
-    if debug:
-        logging.basicConfig(
-            format="%(levelname)s: %(name)s: %(message)s", level=logging.DEBUG
-        )
-    else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(message)s",
-            datefmt="[%X]",
-            handlers=[RichHandler(console=console, show_path=False, markup=False)],
-        )
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        if verbose:
-            logging.getLogger("kp2bw").setLevel(VERBOSE)
+    #   default : INFO via RichHandler  — httpx quiet on console, file gets all
+    #   -v      : VERBOSE for kp2bw     — per-entry detail on console
+    #   -d      : DEBUG for everything  — raw format, httpx included on console
+    # A full-detail DEBUG log is always written to a file regardless of the above.
+    log_path = _configure_logging(verbose=verbose, debug=debug)
+    if log_path is not None:
+        logger.info(f"Writing full debug log to {log_path}")
 
     # Verify the Bitwarden CLI is available before prompting for secrets, so the
     # user isn't asked for passwords only to hit a missing-`bw` failure later.

@@ -215,6 +215,39 @@ def sanitize_cli_output(
     return sanitized
 
 
+def format_http_error(resp: httpx.Response) -> str:
+    """Extract a human-readable reason from a 4xx/5xx HTTP response.
+
+    ``bw serve`` returns its ``{success, message}`` envelope (and Vaultwarden a
+    validation payload) even on error responses, but the body was previously
+    discarded -- turning every rejection into an opaque ``HTTP 400`` with no
+    cause.  This pulls out ``message``/``validationErrors`` (or the raw text when
+    the body is not the expected JSON shape) so the real reason reaches logs and
+    errors.  Whitespace-normalised and truncated via :func:`sanitize_cli_output`;
+    only the *response* body is read, never request data, so no secret is logged.
+    """
+    try:
+        parsed: Any = resp.json()
+    except ValueError:
+        text = resp.text
+        return sanitize_cli_output(text) if text.strip() else "(empty response body)"
+    if isinstance(parsed, dict):
+        body: dict[str, Any] = cast(dict[str, Any], parsed)
+        message: object = body.get("message")
+        details: object = body.get("validationErrors") or body.get("errors")
+        parts: list[str] = []
+        if message:
+            parts.append(str(message))
+        if details:
+            parts.append(f"details={details}")
+        if parts:
+            return sanitize_cli_output(" ".join(parts))
+    # Parsed but not the expected object envelope (array/scalar): fall back to
+    # the raw text rather than re-serialising an unknown-typed value.
+    text = resp.text
+    return sanitize_cli_output(text) if text.strip() else "(empty response body)"
+
+
 def _find_free_port() -> int:
     """Find an available TCP port on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -495,7 +528,8 @@ class BitwardenServeClient:
         )
         if resp.status_code >= 400:
             raise BitwardenClientError(
-                f"bw serve returned HTTP {resp.status_code} for {method} {path}"
+                f"bw serve returned HTTP {resp.status_code} for {method} {path}: "
+                f"{format_http_error(resp)}"
             )
 
         try:
