@@ -285,9 +285,11 @@ def _configure_logging(*, verbose: bool, debug: bool) -> Path | None:
     """
     root = logging.getLogger()
     # Clean slate so a second main() invocation (e.g. in tests) does not stack
-    # duplicate handlers.
+    # duplicate handlers; close each as it is removed so a prior run's file
+    # handle is released rather than leaked.
     for handler in list(root.handlers):
         root.removeHandler(handler)
+        handler.close()
     root.setLevel(logging.DEBUG)
 
     if debug:
