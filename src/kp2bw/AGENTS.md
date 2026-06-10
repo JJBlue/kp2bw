@@ -16,9 +16,7 @@ src/kp2bw/
 ├── _console.py         # Shared Rich Console instance (stderr)
 ├── exceptions.py       # BitwardenClientError, ConversionError
 ├── __main__.py         # python -m kp2bw handoff
-├── __init__.py         # __version__ from installed metadata
-├── bw_import.py        # Legacy bw import JSON path (retained)
-└── bitwardenclient.py  # Legacy subprocess wrapper (retained)
+└── __init__.py         # __version__ from installed metadata
 ```
 
 ## WHERE TO LOOK
@@ -52,7 +50,6 @@ src/kp2bw/
 
 ## NOTES
 
-- `bw_serve.py` is the active transport path; `bw_import.py` and `bitwardenclient.py` are legacy/reference.
 - Maintain behavior parity for `kp2bw.cli:main` and `python -m kp2bw`.
 - Existing-item sync (`--update` / `--no-update`, `KP2BW_UPDATE`, default on, `Converter(update_existing=...)`):
   `convert._reconcile_existing_item()` diffs a matched login item via `_content_differs()` and, when changed, `PUT`s a
