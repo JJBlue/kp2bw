@@ -254,18 +254,30 @@ def _fail(exc: BaseException) -> NoReturn:
     sys.exit(1)
 
 
-# Third-party loggers whose INFO/DEBUG chatter is valuable in the file log but
-# noise on the console; the file handler keeps everything, the console handler
-# drops them below WARNING unless --debug asks for the full firehose.
+# Third-party loggers whose DEBUG/INFO chatter is valuable in the always-on file
+# log but noise on the console. The loggers stay at DEBUG (so the file keeps
+# everything); console handlers attach a ConsoleNoiseFilter to drop their
+# sub-WARNING records, keeping file completeness and console verbosity decoupled.
 _NOISY_LOGGERS: frozenset[str] = frozenset({"httpx", "httpcore"})
 
 
-class _ConsoleNoiseFilter(logging.Filter):
-    """Drop third-party sub-WARNING records from the console handler only."""
+class ConsoleNoiseFilter(logging.Filter):
+    """Drop sub-WARNING records of the *muted* loggers from a console handler.
+
+    The muted loggers stay at DEBUG so the file handler still records them; this
+    only keeps that detail off whichever console handler it is attached to.
+    ``muted`` defaults to every noisy logger (the plain console); ``--debug``
+    attaches it muting only ``httpcore``, so the debug console shows httpx
+    request lines while httpcore connection spam stays file-only.
+    """
+
+    def __init__(self, muted: frozenset[str] = _NOISY_LOGGERS) -> None:
+        super().__init__()
+        self._muted = muted
 
     def filter(self, record: logging.LogRecord) -> bool:
         root_name = record.name.split(".", 1)[0]
-        return not (root_name in _NOISY_LOGGERS and record.levelno < logging.WARNING)
+        return not (root_name in self._muted and record.levelno < logging.WARNING)
 
 
 def _resolve_log_path() -> Path:
@@ -301,10 +313,16 @@ def _configure_logging(*, verbose: bool, debug: bool) -> Path | None:
     """Configure console + always-on file logging; return the log path.
 
     Console verbosity follows the flags (INFO default, VERBOSE with ``-v``, full
-    DEBUG with ``-d``).  A file handler is *always* attached at DEBUG so a
-    complete trace -- per-entry detail plus one line per HTTP request -- is
-    captured regardless of console verbosity.  Returns ``None`` when the log file
-    cannot be opened, so a logging-setup failure never aborts a migration.
+    DEBUG with ``-d``).  A file handler is *always* attached at DEBUG, and the
+    transport loggers (``httpx``/``httpcore``) are pinned to DEBUG too, so the
+    file captures a complete trace -- per-entry detail plus full request and
+    connection logs -- regardless of console verbosity.  The console stays clean
+    because each console handler filters that noise out itself
+    (see :class:`ConsoleNoiseFilter`), never by lowering the loggers (which
+    would also starve the file).  Pinning the ``httpx``/``httpcore`` levels is a
+    deliberate process-wide side effect that is not restored, so the file keeps
+    capturing transport traces for the whole run.  Returns ``None`` when the log
+    file cannot be opened, so a logging-setup failure never aborts a migration.
     """
     root = logging.getLogger()
     # Clean slate so a second main() invocation (e.g. in tests) does not stack
@@ -315,24 +333,28 @@ def _configure_logging(*, verbose: bool, debug: bool) -> Path | None:
         handler.close()
     root.setLevel(logging.DEBUG)
 
+    # Pin the transport loggers to DEBUG in every mode so the always-on file
+    # captures full httpx/httpcore traces -- the data that explains timeouts and
+    # dropped connections (#24). Quieting is a console-handler concern (filters
+    # below); doing it via logger level would also starve the file.
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+    logging.getLogger("httpcore").setLevel(logging.DEBUG)
+
     if debug:
         console_handler: logging.Handler = logging.StreamHandler()
         console_handler.setFormatter(
             logging.Formatter("%(levelname)s: %(name)s: %(message)s")
         )
         console_handler.setLevel(logging.DEBUG)
-        logging.getLogger("httpx").setLevel(logging.DEBUG)
-        logging.getLogger("httpcore").setLevel(logging.INFO)
+        # Debug console shows kp2bw + httpx detail; httpcore connection spam is
+        # left to the file only.
+        console_handler.addFilter(ConsoleNoiseFilter(frozenset({"httpcore"})))
     else:
         console_handler = RichHandler(
             console=console, show_path=False, markup=False, log_time_format="[%X]"
         )
         console_handler.setLevel(VERBOSE if verbose else logging.INFO)
-        console_handler.addFilter(_ConsoleNoiseFilter())
-        # One INFO line per HTTP request reaches the file (useful for timing and
-        # tracing) while the console filter above keeps it quiet.
-        logging.getLogger("httpx").setLevel(logging.INFO)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        console_handler.addFilter(ConsoleNoiseFilter())
     root.addHandler(console_handler)
 
     try:
