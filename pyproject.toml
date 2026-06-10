@@ -37,7 +37,6 @@ kp2bw = "kp2bw.cli:main"
 
 [dependency-groups]
 dev     = [
-  "types-pyyaml>=6.0.12.20260518",
   { include-group = "codegen" },
   { include-group = "lint" },
   { include-group = "stubs" },
