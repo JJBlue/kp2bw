@@ -9,6 +9,41 @@ Check your version with `kp2bw --version` and compare it to the latest release o
 
 If you're outdated, update to the latest version and try again.
 
+## Windows: "untrusted mount point" (os error 448) from `uv` / `uvx`
+
+If `uvx kp2bw`, `uv run kp2bw` or even a plain `uv sync` dies before kp2bw starts with:
+
+```console
+error: Failed to inspect Python interpreter from managed installations at
+       `C:\Users\<you>\AppData\Roaming\uv\python\cpython-3.14-windows-x86_64-none\python.exe`
+  Caused by: Failed to query Python interpreter
+  Caused by: failed to query metadata of file `...\python.exe`: The path cannot be traversed
+             because it contains an untrusted mount point. (os error 448)
+```
+
+nothing is wrong with kp2bw or your vault. Windows is refusing to follow a directory junction that uv relies on.
+
+uv keeps each managed Python in a versioned directory (`cpython-3.14.4-windows-x86_64-none`) and points a minor-version
+junction (`cpython-3.14-windows-x86_64-none`) at it. Windows hardening around mount-point traversal (reported in the
+wild since spring 2026, often alongside the OneDrive Files On-Demand filter; see [uv#19616] and [warp#9044]) can flag a
+previously created junction as untrusted, after which *every* process gets error 448 when crossing it. The Python
+installation behind the junction is intact.
+
+The fix is to recreate the junctions: a freshly created one is trusted again. In PowerShell:
+
+```powershell
+Get-ChildItem "$env:APPDATA\uv\python" -Force |
+    Where-Object LinkType -eq 'Junction' |
+    ForEach-Object {
+        $target = $_.Target
+        $_.Delete()
+        New-Item -ItemType Junction -Path $_.FullName -Target $target | Out-Null
+    }
+```
+
+Then re-run the command that failed. If the error returns after a Windows update or a new `uv python install`, run the
+snippet again.
+
 ## `bw` not found on `PATH`
 
 kp2bw shells out to the [Bitwarden CLI]. If `bw` isn't installed or isn't on your `PATH`, kp2bw stops before prompting
@@ -112,4 +147,6 @@ import. Resolve the underlying limit and re-run to upload the remaining files.
 [Vaultwarden 1.36.0]: https://github.com/dani-garcia/vaultwarden/releases/tag/1.36.0
 [bw:versions]: https://npm.im/package/@bitwarden/cli?activeTab=versions "@bitwarden/cli | npm versions tab"
 [kp2bw:release:latest]: https://github.com/kjanat/kp2bw/releases/latest
+[uv#19616]: https://github.com/astral-sh/uv/issues/19616
 [vaultwarden#7156]: https://github.com/dani-garcia/vaultwarden/pull/7156
+[warp#9044]: https://github.com/warpdotdev/warp/issues/9044
