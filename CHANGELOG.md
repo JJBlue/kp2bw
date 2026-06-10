@@ -15,6 +15,47 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   file instead of your shell history; a real shell variable still overrides a `.env` entry, keeping the documented CLI
   flag > env var > default precedence. The KeePass database path -- previously CLI-only -- can now be supplied via
   `KP2BW_KEEPASS_FILE`, making the positional `FILE` optional. A new `.env.example` documents every supported variable.
+- **Always-on DEBUG log file** -- a complete DEBUG trace (including third-party `httpx`/`bw serve` detail) is now always
+  written to a per-user log file regardless of console verbosity -- `%LOCALAPPDATA%\kp2bw\logs` on Windows, the platform
+  data dir elsewhere -- so a failed run leaves a full record to share without re-running with `-v`/`-d`. Override the
+  file with `KP2BW_LOG_FILE` or the directory with `KP2BW_LOG_DIR`. The console stays as quiet as before by default.
+- **A heads-up when the `bw serve` server and CLI versions disagree** -- a server/CLI version mismatch (a common source
+  of confusing `bw serve` failures) is flagged up front instead of surfacing later as an opaque error.
+
+### Changed
+
+- **KeePass tags and expiry now fold into a single `KP2BW_META` field; `Created`/`Modified` are no longer migrated** --
+  the metadata Bitwarden has no native slot for is serialised as YAML into one `KP2BW_META` custom field (PyYAML
+  `safe_dump`, so control characters and the U+0085/2028/2029 line breaks are escaped, not silently corrupted) instead
+  of several separate `Tags`/`Expires`/date fields, and the field is omitted entirely when an entry has neither tags nor
+  an expiry. Creation/modification timestamps are dropped: Bitwarden manages its own creation/revision dates and the API
+  cannot backdate them (a client-supplied date is ignored on create and rejected on update), so they had no real home.
+
+### Removed
+
+- **The unused legacy `bitwardenclient` and `bw_import` modules** -- the deprecated subprocess-per-operation CLI wrapper
+  and the file-based `bw import` path, both long superseded by the `bw serve` HTTP transport and reachable from no
+  supported entry point, were removed (git history retains them for reference).
+
+### Fixed
+
+- **Distinct entries sharing a title no longer collapse onto one Bitwarden item (silent data loss)** -- deduplication
+  keyed on `(folder, title)`, so several different logins that happened to share a title (e.g. four accounts all named
+  `192.168.2.67`) merged into a single item and re-runs churned non-idempotently. Every migrated item now carries its
+  source KeePass entry UUID in a `KP2BW_ID` field and dedup keys on that: a match by UUID stays idempotent across
+  title/folder edits, an unstamped legacy item is adopted once and back-stamped, and only a genuinely new entry creates
+  a new item.
+- **A single slow or dropped `bw serve` request no longer aborts the whole migration** (#24) -- a create that timed out
+  or hit a dropped keep-alive connection (`httpx.ReadTimeout`/`ReadError`) crashed the run and stranded every entry
+  after it. Idempotent requests (including the startup sync/unlock) are now retried on a transient transport error, and
+  a per-entry create, folder, or collection failure is reported and skipped rather than fatal -- so the migration
+  finishes, the summary counts what failed, and a re-run safely adopts anything a timed-out request already created
+  server-side.
+- **`bw serve` HTTP errors now carry the server's actual message** -- a failed request surfaces the response body
+  (Bitwarden/Vaultwarden's real `message` / validation error) instead of an opaque `HTTP 400`.
+- **Windows: orphaned `bw serve` processes are reaped reliably** -- a shim-launched `bw serve` runs as a `node`
+  grandchild that `taskkill /T` did not always reap, leaving orphans that deadlocked the shared `bw` app-data on later
+  runs. Teardown now also kills whatever still listens on the serve port, regardless of process-tree shape.
 
 ## [3.4.1] - 2026-06-09
 

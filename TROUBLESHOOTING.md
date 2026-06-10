@@ -54,7 +54,7 @@ npm view @bitwarden/cli versions
 (the CLI ships as [`@bitwarden/cli`][bw:versions] on npm) and work backwards until login succeeds.
 
 kp2bw runs whatever `bw` is on your `PATH`, so the version you settle on has to *be* that `bw`. Install it globally and
-se the same CLI for the manual login step too:
+use the same CLI for the manual login step too:
 
 ```shell
 npm install -g @bitwarden/cli@<version>

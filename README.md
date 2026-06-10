@@ -12,11 +12,11 @@ with advantages over the built-in Bitwarden importer:
 - <details open><summary><b>Passkey migration</b></summary> KeePassXC FIDO2/passkey credentials (<code>KPEX_PASSKEY_*</code>) are converted to Bitwarden <code>fido2Credentials</code>.</details>
 - <details><summary><b>Custom properties &amp; attachments</b></summary> Imported as Bitwarden custom fields or attachments (values &gt;10k chars auto-upload as files).</details>
 - <details><summary><b>Long notes handling</b></summary> Notes exceeding 10k chars are uploaded as <code>notes.txt</code> attachments.</details>
-- <details><summary><b>Idempotent re-runs that sync changes</b></summary> Safe to run repeatedly; existing entries are updated in place when their KeePass content changed (notes, credentials, URIs, fields) and never duplicated.<br> Disable with <code>--no-update</code>.</details>
+- <details><summary><b>Idempotent re-runs that sync changes</b></summary> Safe to run repeatedly; existing entries are updated in place when their KeePass content changed (notes, credentials, URIs, fields) and never duplicated. Each item is stamped with its KeePass UUID in a <code>KP2BW_ID</code> field, so distinct entries that share a title stay separate and a re-run is matched by identity rather than title.<br> Disable updates with <code>--no-update</code>.</details>
 - <details><summary><b>Nested folders</b></summary> KeePass folder hierarchy is recreated in Bitwarden.</details>
 - <details><summary><b>Recycle Bin filtering</b></summary> Deleted entries are automatically excluded.</details>
 - <details><summary><b>Expiry awareness</b></summary> Expired entries are marked <code>[EXPIRED]</code> in notes; optionally skip them entirely with <code>--skip-expired</code>.</details>
-- <details><summary><b>Metadata preservation</b></summary> KeePass tags, expiry dates, and created/modified timestamps are stored as Bitwarden custom fields.</details>
+- <details><summary><b>Metadata preservation</b></summary> KeePass tags and expiry date are folded into a single <code>KP2BW_META</code> custom field (YAML), omitted when an entry has neither. Created/modified timestamps are not migrated — Bitwarden manages its own creation/revision dates.</details>
 - <details><summary><b>Tag filtering</b></summary> Import only entries matching specific tags.</details>
 - <details><summary><b>Organization &amp; collection support</b></summary> Upload into a Bitwarden organization with automatic or manual collection assignment.</details>
 - <details><summary><b>Full UTF-8 &amp; cross-platform</b></summary> Works on Windows, macOS, and Linux.</details>
@@ -102,7 +102,7 @@ kp2bw [-h] [-V] [-k PASSWORD] [-K FILE] [-b PASSWORD] [-o ID]
 | `--path-to-name-skip`                  | Skip first N folders in path prefix (default: 1)                                                          | `KP2BW_PATH_TO_NAME_SKIP`             |
 | `--skip-expired`                       | Skip entries that have expired in KeePass                                                                 | `KP2BW_SKIP_EXPIRED`                  |
 | `--include-recycle-bin`                | Include Recycle Bin entries (excluded by default)                                                         | `KP2BW_INCLUDE_RECYCLE_BIN`           |
-| `--metadata` / `--no-metadata`         | Toggle KeePass metadata as custom fields (default: on)                                                    | `KP2BW_MIGRATE_METADATA`              |
+| `--metadata` / `--no-metadata`         | Toggle KeePass tags/expiry as a `KP2BW_META` field (default: on)                                          | `KP2BW_MIGRATE_METADATA`              |
 | `--update` / `--no-update`             | Update existing entries changed in KeePass (default: on)                                                  | `KP2BW_UPDATE`                        |
 | `--include-oversize-secrets`           | Offload over-limit secret fields[^offload] to a `.txt` attachment instead of dropping them (default: off) | `KP2BW_INCLUDE_OVERSIZE_SECRETS`      |
 | `-y, --yes`                            | Skip the Bitwarden CLI setup confirmation prompt                                                          | `KP2BW_YES`                           |
@@ -129,6 +129,11 @@ Then just run `kp2bw` with no arguments. A real shell environment variable still
 (precedence is unchanged: CLI flag > env var > default), and `.env` is gitignored so secrets stay local.
 
 ## Troubleshooting
+
+Every run writes a full DEBUG log to a per-user file even when the console stays quiet, so a failed run leaves a
+complete record to share. On Windows that is `%LOCALAPPDATA%\kp2bw\logs`; override the file with `KP2BW_LOG_FILE` or the
+directory with `KP2BW_LOG_DIR`. `bw serve` errors include the server's actual message, and a slow or dropped request no
+longer aborts the run — failed entries are counted in the summary and a re-run safely picks up where it left off.
 
 See [TROUBLESHOOTING].
 
