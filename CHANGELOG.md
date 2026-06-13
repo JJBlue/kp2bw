@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] <!-- #28 -->
+
+### Added
+
+- **`--strip-ids` finalize mode (env `KP2BW_STRIP_IDS`) to remove kp2bw's `KP2BW_ID` dedup stamps** -- every migrated
+  item carries a plain-text `KP2BW_ID` custom field (the KeePass UUID kp2bw matches on for idempotent re-runs). Once a
+  user is satisfied the migration is complete and ready to fully adopt Bitwarden, `kp2bw --strip-ids` removes that stamp
+  from every migrated item and exits -- no KeePass database is read, no migration runs. Scope follows `-o`/`-c` exactly
+  as a migration would; other vault data is untouched. The strip itself is safe to repeat (a second pass finds nothing),
+  but it is **irreversible** and makes future migration re-runs unreliable: without the stamp a re-run falls back to
+  folder + name matching -- the exact collision the stamp disambiguates -- so entries sharing a folder and title can be
+  duplicated or mismatched. Because of that it confirms before changing anything (skippable with `-y` for callers who
+  know what they want) -- a deliberate final step, not a routine flag.
+
 ## [3.5.0] - 2026-06-10
 
 ### Added
