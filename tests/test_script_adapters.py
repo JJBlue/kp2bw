@@ -39,8 +39,20 @@ def test_bw_serve_timeout_script() -> None:
     _run_script_main("bw_serve_timeout_test.py")
 
 
+def test_bw_serve_teardown_script() -> None:
+    _run_script_main("bw_serve_teardown_test.py")
+
+
 def test_strip_ids_script() -> None:
     _run_script_main("strip_ids_test.py")
+
+
+def test_uri_mapping_script() -> None:
+    _run_script_main("uri_mapping_test.py")
+
+
+def test_migrate_uris_script() -> None:
+    _run_script_main("migrate_uris_test.py")
 
 
 def test_otp_script() -> None:

@@ -8,8 +8,48 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`bw serve` is no longer orphaned on teardown (POSIX), which previously hung the process.** On Linux/macOS `bw` is
+  commonly a node launcher that spawns a worker; teardown signalled only the tracked PID, leaving the worker alive -- it
+  kept the port and, when kp2bw's stdout was a pipe, held the pipe open so the parent pipeline never reached EOF (a
+  multi-minute "still running" hang) and accumulated orphaned `bw serve` processes across runs. `bw serve` is now
+  started in its own session (`start_new_session=True`) and torn down by signalling the whole process group (SIGTERM,
+  then SIGKILL after a timeout), so the launcher and worker die together. Windows teardown (taskkill /T + port reap) is
+  unchanged.
+
+- **An empty environment variable no longer shadows the matching `.env` entry.** `KP2BW_KEEPASS_FILE=""` (or any
+  empty-string export) used to override the `.env` value -- `load_dotenv(override=False)` treats an empty export as
+  "set" -- producing a baffling "KeePass database path is required" even when `.env` clearly had it. `_load_dotenv` now
+  fills any variable that is unset *or empty* from the file, while a real *non-empty* shell variable still wins (the
+  documented CLI flag > env var > default precedence is preserved for meaningful values).
+
 ### Added
 
+- **`--report-uris keepass|bitwarden` -- a read-only URI collision report** (env `KP2BW_REPORT_URIS`). Groups every
+  login URL by registrable domain (a curated two-level public-suffix heuristic, so `10bis.co.il` stays whole) and lists
+  the domains with more than one host -- exactly the logins that all surface together under Bitwarden's base-domain
+  matching. `keepass` reads the database (previewing post-migration collisions); `bitwarden` reads the live vault
+  (honouring `-o`/`-c`). It changes nothing -- it just prints, so you can decide which entries to switch to Host match
+  (or flip your account's default URI match detection).
+
+- **Additional URLs and Android packages migrate as Bitwarden login URIs, not custom fields** -- a KeePass(XC) entry's
+  additional URLs (`KP2A_URL`/`KP2A_URL_n`, plus the plainer `URL`/`URL_n` convention) and Android packages
+  (`AndroidApp`/`AndroidApp_n`, including the no-underscore `AndroidApp1` variant) were copied verbatim into custom
+  fields, where they were inert. They now become real entries in `login.uris`, so one login autofills across every site
+  and app it covered in KeePass; free-text URL labels (`API Url`, `Alt. URL`, `Website`, …) are deliberately left as
+  custom fields. Each URI gets a per-URI match mode reproducing KeePassXC's behaviour: a plain URL → the account default
+  (`match` left unset -- what Bitwarden itself writes on export; `--uri-match` / `KP2BW_URI_MATCH` overrides, e.g.
+  `domain` forces base-domain to replicate KeePassXC's host-based matching), a double-quoted URL → exact, and a `*`
+  wildcard → starts-with (trailing path) or regex. `AndroidApp` becomes an `androidapp://` URI. Non-web schemes
+  (`keepassxc://`, `cmd://`, `kdbx://`, `file://`) and unresolved `{REF:…}` URLs are dropped rather than left as dead
+  URIs. `--no-interpret-uri-syntax` (`KP2BW_INTERPRET_URI_SYNTAX`) disables the quote/wildcard interpretation for a
+  literal import. Bitwarden applies a regex to the whole URL (unlike KeePassXC's separate host/path regexes), so complex
+  wildcards are emitted as a best-effort whole-URL regex with a warning to review. Items imported before this are
+  upgraded by a normal re-run (the change is detected and the item updated in place); for users who don't want to
+  re-import, `kp2bw --migrate-uris` (env `KP2BW_MIGRATE_URIS`) is a Bitwarden-only one-shot pass that re-folds the
+  legacy fields into URIs on every existing item. Both honour `--uri-match` / `--interpret-uri-syntax` and `-o`/`-c`
+  scope.
 - **Configurable per-request HTTP timeout via `KP2BW_HTTP_TIMEOUT`** -- the timeout for a single `bw serve` request is
   now overridable through the `KP2BW_HTTP_TIMEOUT` environment variable (seconds), so a slow self-hosted server (e.g.
   Vaultwarden) where an individual item write outlasts the default no longer times out. Non-numeric or non-positive

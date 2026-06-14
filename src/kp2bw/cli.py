@@ -7,15 +7,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import dotenv_values, find_dotenv
 from rich.logging import RichHandler
 from rich.markup import escape
 
 from . import VERBOSE, __title__, __version__
 from ._console import console
 from .bw_serve import KP2BW_ID_FIELD_NAME, BitwardenServeClient, ensure_bw_available
-from .convert import Converter
+from .convert import Converter, collect_keepass_uris
 from .exceptions import BitwardenClientError, ConversionError
+from .uri_mapping import (
+    UriMatchValue,
+    collision_groups,
+    match_value_names,
+    parse_match_name,
+    registrable_domain,
+    uri_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +92,22 @@ def _load_dotenv() -> str | None:
     Returns the path that was loaded, or ``None`` when no ``.env`` is found.
     ``usecwd=True`` anchors the search at the user's working directory rather
     than this module's install location, so an installed ``kp2bw`` still picks
-    up the project ``.env``.  ``override`` is left at its default of ``False``
-    so a real shell environment variable always wins over a file entry: a
-    ``.env`` value simply occupies the env tier of the documented
-    CLI flag > env var > default precedence.
+    up the project ``.env``.
+
+    A real, *non-empty* shell variable still wins over a file entry (the
+    documented CLI flag > env var > default precedence). But a variable that is
+    set to the **empty string** must not shadow a ``.env`` value: that is almost
+    never intended and produces a baffling "X is required" when the file clearly
+    has it. So unlike a plain ``load_dotenv(override=False)`` -- which treats an
+    empty export as "set" and skips it -- this fills any key that is currently
+    unset *or empty* from the file, leaving non-empty exports untouched.
     """
     dotenv_path = find_dotenv(usecwd=True)
     if not dotenv_path:
         return None
-    _ = load_dotenv(dotenv_path)
+    for key, value in dotenv_values(dotenv_path).items():
+        if value is not None and not os.environ.get(key):
+            os.environ[key] = value
     return dotenv_path
 
 
@@ -230,6 +245,32 @@ def _argparser() -> MyArgParser:
         default=None,
     )
     parser.add_argument(
+        "--uri-match",
+        dest="uri_match",
+        metavar="MODE",
+        choices=match_value_names(),
+        help=(
+            "Match mode for plain URLs migrated into login URIs: "
+            "domain|host|startswith|exact|regex|never|default. 'default' (the "
+            "default) leaves match unset so Bitwarden uses your account default "
+            "-- what Bitwarden itself writes; 'domain' forces base-domain to "
+            "replicate KeePassXC's host-based matching regardless. Quoted-exact "
+            "and wildcard URLs keep their own modes (env: KP2BW_URI_MATCH)"
+        ),
+        default=None,
+    )
+    parser.add_argument(
+        "--interpret-uri-syntax",
+        dest="interpret_uri_syntax",
+        help=(
+            "Interpret KeePassXC URL syntax on additional URLs — double-quoted as "
+            "exact, '*' as wildcard (default: on). --no-interpret-uri-syntax "
+            "imports every URL as a plain string (env: KP2BW_INTERPRET_URI_SYNTAX)"
+        ),
+        action=BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
         "--strip-ids",
         dest="strip_ids",
         help=(
@@ -241,6 +282,34 @@ def _argparser() -> MyArgParser:
             "for scope (env: KP2BW_STRIP_IDS)"
         ),
         action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--migrate-uris",
+        dest="migrate_uris",
+        help=(
+            "Upgrade existing Bitwarden items in place: re-fold legacy "
+            "KP2A_URL*/AndroidApp custom fields into login URIs, then exit (no "
+            "migration, no KeePass database needed). For users who imported "
+            "before URL folding and don't want to re-import. Honors --uri-match / "
+            "--interpret-uri-syntax and -o/-c for scope (env: KP2BW_MIGRATE_URIS)"
+        ),
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--report-uris",
+        dest="report_uris",
+        metavar="SOURCE",
+        choices=("keepass", "bitwarden"),
+        help=(
+            "Print a read-only URI collision report and exit (changes nothing): "
+            "groups login URLs by registrable domain and lists the ones with "
+            "multiple hosts -- the entries that all surface together under "
+            "Bitwarden base-domain match. SOURCE is 'keepass' (reads the KeePass "
+            "db) or 'bitwarden' (reads the live vault). Honors -o/-c for the "
+            "bitwarden source (env: KP2BW_REPORT_URIS)"
+        ),
         default=None,
     )
     parser.add_argument(
@@ -360,6 +429,122 @@ def _run_strip_ids(
             f"No items carried a {KP2BW_ID_FIELD_NAME} stamp in {escape(scope)} "
             f"({result.scanned} scanned); nothing to do."
         )
+
+
+def _run_migrate_uris(
+    *,
+    bitwarden_password_arg: str | None,
+    org_id: str | None,
+    collection_id: str | None,
+    skip_confirm: bool,
+    uri_match: UriMatchValue,
+    interpret_uri_syntax: bool,
+) -> None:
+    """Upgrade existing items: re-fold legacy URL/app custom fields into URIs.
+
+    The Bitwarden-only counterpart of the new-import URL folding, for users who
+    imported before it and do not want to re-import. No KeePass database is read;
+    scope follows ``-o``/``-c``. The change is additive and idempotent (the
+    field's data survives as a URI), so the confirmation is skippable with ``-y``.
+    Errors surface as an actionable message rather than a traceback.
+    """
+    scope = _describe_scope(org_id, collection_id)
+    try:
+        if not skip_confirm:
+            console.print(
+                "This re-folds legacy [bold]KP2A_URL*[/bold]/[bold]AndroidApp[/bold] "
+                f"custom fields into login URIs on items in [bold]{escape(scope)}[/bold] "
+                "(the field data is preserved as a URI, then the field removed)."
+            )
+            if not _confirm("Migrate URL fields to URIs? [y/n]: "):
+                console.print("[yellow]Aborted; nothing changed.[/yellow]")
+                sys.exit(0)
+
+        bw_pw = _read_password(
+            bitwarden_password_arg, "Please enter your Bitwarden password: "
+        )
+        with BitwardenServeClient(
+            bw_pw, org_id=org_id, collection_id=collection_id
+        ) as bw:
+            result = bw.migrate_url_fields_to_uris(
+                plain_match=uri_match, interpret_syntax=interpret_uri_syntax
+            )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
+    except (BitwardenClientError, ConversionError) as exc:
+        _fail(exc)
+
+    if result.migrated:
+        console.print(
+            f"[green]Migrated URL fields to URIs on {result.migrated} of "
+            f"{result.scanned} item(s).[/green]"
+        )
+    else:
+        console.print(
+            f"No items carried legacy URL fields in {escape(scope)} "
+            f"({result.scanned} scanned); nothing to do."
+        )
+
+
+def _print_uri_report(uris: list[str], source: str) -> None:
+    """Print the read-only URI collision report to stdout (changes nothing).
+
+    Groups hosts by registrable domain and lists the multi-host groups -- the
+    logins that all surface together under Bitwarden's base-domain matching.
+    The header goes through the Rich console; the data lines are plain ``print``
+    so they copy/paste cleanly.
+    """
+    groups = collision_groups(uris)
+    bases = {registrable_domain(host) for u in uris if (host := uri_host(u))}
+    console.print(
+        f"[bold]URI collision report ({source})[/bold]: {len(uris)} URIs across "
+        f"{len(bases)} base domain(s); [bold]{len(groups)}[/bold] have multiple "
+        "hosts (these all surface together under Bitwarden base-domain match -- "
+        "switch them to Host match to separate them)."
+    )
+    if not groups:
+        print("# no base-domain collisions")
+        return
+    for base, hosts in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        print(f"{base} ({len(hosts)}): " + ", ".join(hosts))
+
+
+def _run_report_uris_bitwarden(
+    *,
+    bitwarden_password_arg: str | None,
+    org_id: str | None,
+    collection_id: str | None,
+) -> None:
+    """Read the live Bitwarden vault and print the URI collision report.
+
+    Read-only Bitwarden mode (no KeePass): lists in-scope items, gathers their
+    login URIs, and reports the base-domain collisions. Scope follows ``-o``/``-c``.
+    """
+    bw_pw = _read_password(
+        bitwarden_password_arg, "Please enter your Bitwarden password: "
+    )
+    try:
+        with BitwardenServeClient(
+            bw_pw, org_id=org_id, collection_id=collection_id
+        ) as bw:
+            items = bw.list_items(organization_id=org_id, collection_id=collection_id)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
+    except (BitwardenClientError, ConversionError) as exc:
+        _fail(exc)
+
+    uris: list[str] = []
+    for item in items:
+        login = item.get("login")
+        if login is None:
+            continue
+        for entry in login.get("uris") or []:
+            value = entry.get("uri")
+            if value:
+                uris.append(value)
+    _print_uri_report(uris, "bitwarden")
 
 
 # Third-party loggers whose DEBUG/INFO chatter is valuable in the always-on file
@@ -528,6 +713,21 @@ def main() -> None:
         strip_ids = _resolve_bool_option(
             args.strip_ids, "KP2BW_STRIP_IDS", default=False
         )
+        migrate_uris = _resolve_bool_option(
+            args.migrate_uris, "KP2BW_MIGRATE_URIS", default=False
+        )
+        raw_report = _with_env(args.report_uris, "KP2BW_REPORT_URIS")
+        report_uris = raw_report.strip().lower() if raw_report else None
+        if report_uris not in (None, "keepass", "bitwarden"):
+            raise ValueError(
+                f"Invalid KP2BW_REPORT_URIS={raw_report!r}; use 'keepass' or 'bitwarden'"
+            )
+        interpret_uri_syntax = _resolve_bool_option(
+            args.interpret_uri_syntax, "KP2BW_INTERPRET_URI_SYNTAX", default=True
+        )
+        uri_match: UriMatchValue = parse_match_name(
+            _with_env(args.uri_match, "KP2BW_URI_MATCH") or "default"
+        )
         verbose = _resolve_bool_option(args.verbose, "KP2BW_VERBOSE", default=False)
         debug = _resolve_bool_option(args.debug, "KP2BW_DEBUG", default=False)
     except ValueError as exc:
@@ -550,9 +750,10 @@ def main() -> None:
                 _argparser().print_help()
                 sys.exit(2)
 
-    # --strip-ids is a Bitwarden-only finalize step: no KeePass database is read,
-    # so the path requirement (and the KeePass password prompt below) is skipped.
-    if not strip_ids and not args.keepass_file:
+    # Bitwarden-only modes read no KeePass database, so the path requirement
+    # (and the KeePass password prompt below) is skipped for them.
+    bitwarden_only = strip_ids or migrate_uris or report_uris == "bitwarden"
+    if not bitwarden_only and not args.keepass_file:
         _ = sys.stderr.write(
             "ERROR: KeePass database path is required "
             "(positional FILE or KP2BW_KEEPASS_FILE)\n\n"
@@ -578,12 +779,42 @@ def main() -> None:
     if log_path is not None:
         logger.info(f"Writing full debug log to {log_path}")
 
+    # --report-uris keepass reads only the KeePass database (no Bitwarden, no bw
+    # CLI), so it short-circuits before the bw availability check.
+    if report_uris == "keepass":
+        kp_pw = _read_password(
+            args.kp_pw, "Please enter your KeePass 2.x db password: "
+        )
+        assert args.keepass_file is not None
+        try:
+            uris = collect_keepass_uris(
+                args.keepass_file,
+                kp_pw,
+                args.kp_keyfile,
+                uri_match=uri_match,
+                interpret_uri_syntax=interpret_uri_syntax,
+            )
+        except (OSError, ValueError) as exc:
+            _fail(exc)
+        _print_uri_report(uris, "keepass")
+        return
+
     # Verify the Bitwarden CLI is available before prompting for secrets, so the
     # user isn't asked for passwords only to hit a missing-`bw` failure later.
     try:
         ensure_bw_available()
     except BitwardenClientError as exc:
         _fail(exc)
+
+    # --report-uris bitwarden reads the live vault (no KeePass) and prints a
+    # read-only collision report.
+    if report_uris == "bitwarden":
+        _run_report_uris_bitwarden(
+            bitwarden_password_arg=args.bw_pw,
+            org_id=args.bw_org,
+            collection_id=args.bw_coll,
+        )
+        return
 
     # --strip-ids short-circuits migration entirely: it only touches Bitwarden
     # (remove kp2bw's dedup stamps), so it needs neither the bw-setup spiel nor a
@@ -594,6 +825,18 @@ def main() -> None:
             org_id=args.bw_org,
             collection_id=args.bw_coll,
             skip_confirm=skip_confirm,
+        )
+        return
+
+    # --migrate-uris is likewise a Bitwarden-only upgrade pass (no KeePass).
+    if migrate_uris:
+        _run_migrate_uris(
+            bitwarden_password_arg=args.bw_pw,
+            org_id=args.bw_org,
+            collection_id=args.bw_coll,
+            skip_confirm=skip_confirm,
+            uri_match=uri_match,
+            interpret_uri_syntax=interpret_uri_syntax,
         )
         return
 
@@ -641,6 +884,8 @@ def main() -> None:
         migrate_metadata=migrate_metadata,
         update_existing=update_existing,
         include_oversize_secrets=include_oversize_secrets,
+        uri_match=uri_match,
+        interpret_uri_syntax=interpret_uri_syntax,
     )
     try:
         failures = c.convert()

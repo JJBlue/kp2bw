@@ -26,6 +26,8 @@ from _snapshot import (
 )
 from pykeepass import Entry, PyKeePass, create_database
 
+from kp2bw.uri_mapping import is_url_attribute_key
+
 logger = logging.getLogger("e2e")
 
 SENSITIVE_ARG_FLAGS = {
@@ -338,6 +340,26 @@ def _create_keepass_snapshot(path: Path, password: str) -> None:
 
     # Empty Password: a login with a username but no password.
     _ = kp.add_entry(kp.root_group, "Empty Password", "lonely-user", "")
+
+    # Multi URL: exercises additional-URL -> login.uris folding end to end. The
+    # KP2A_URL*/URL_*/AndroidApp* custom fields must NOT survive as fields; they
+    # become login URIs with per-URI match modes -- plain -> account default
+    # (match unset), double-quoted -> exact, trailing-path wildcard ->
+    # starts-with, host wildcard -> regex -- plus androidapp:// for packages
+    # (bare and the no-underscore AndroidApp1 variant). The keepassxc:// value is
+    # a non-web scheme and is dropped entirely.
+    multi = kp.add_entry(
+        internet, "Multi URL", "multi-user", "multi-pass", url="https://multi.example"
+    )
+    multi.set_custom_property("KP2A_URL", "https://alt-one.example")
+    multi.set_custom_property("KP2A_URL_1", "https://alt-two.example")
+    multi.set_custom_property("URL_1", "https://alt-three.example")
+    multi.set_custom_property("AndroidApp", "com.multi.app")
+    multi.set_custom_property("AndroidApp1", "androidapp://com.multi.other")
+    multi.set_custom_property("KP2A_URL_2", '"https://exact.example/login"')
+    multi.set_custom_property("KP2A_URL_3", "https://multi.example/area/*")
+    multi.set_custom_property("KP2A_URL_4", "https://*.wild.example/*")
+    multi.set_custom_property("KP2A_URL_5", "keepassxc://by-uuid/dropme")
 
     kp.save()
 
@@ -660,6 +682,37 @@ def _assert_comprehensive_seed(vault: NormVault) -> None:
         )
     if _field(long_field, "hint")["value"] != "see recovery_codes.txt":
         raise AssertionError("Short field beside the long one should stay inline")
+
+    # Additional URLs / Android packages fold into login.uris with per-URI match
+    # modes; the KP2A_URL*/URL_*/AndroidApp* custom fields must NOT survive, and
+    # the keepassxc:// value must be dropped. (Runs unconditionally, so the
+    # non-golden CI leg validates the fold too.)
+    multi = _item_by_name(vault, "Multi URL")
+    multi_uri_list = _login(multi)["uris"]
+    multi_uri_values = [uri["uri"] for uri in multi_uri_list]
+    if len(set(multi_uri_values)) != len(multi_uri_values):
+        raise AssertionError(f"Multi URL has duplicate URIs: {multi_uri_values}")
+    multi_uris = {uri["uri"]: uri["match"] for uri in multi_uri_list}
+    expected_multi_uris: dict[str, int | None] = {
+        "https://multi.example": None,
+        "https://alt-one.example": None,
+        "https://alt-two.example": None,
+        "https://alt-three.example": None,
+        "androidapp://com.multi.app": None,
+        "androidapp://com.multi.other": None,
+        "https://exact.example/login": 3,  # quoted -> exact
+        "https://multi.example/area/": 2,  # trailing wildcard -> starts-with
+        "https://.*\\.wild\\.example/.*": 4,  # host wildcard -> regex
+    }
+    if multi_uris != expected_multi_uris:
+        raise AssertionError(f"Multi URL uris/match wrong: {multi_uris}")
+    leftover = [
+        name
+        for field in multi["fields"]
+        if is_url_attribute_key(name := field["name"] or "")
+    ]
+    if leftover:
+        raise AssertionError(f"Multi URL still carries legacy URL fields: {leftover}")
 
 
 def main() -> None:

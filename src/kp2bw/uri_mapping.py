@@ -1,0 +1,441 @@
+"""Map KeePass(XC) entry URLs onto Bitwarden login URIs with per-URI match modes.
+
+KeePass2Android / KeePassXC store a primary ``URL`` plus any number of
+*additional URLs* in ``KP2A_URL`` / ``KP2A_URL_<n>`` custom attributes, and
+Android package ids in ``AndroidApp`` attributes. Historically kp2bw copied
+those verbatim into Bitwarden *custom fields*, where they are inert noise.
+
+This module converts them into the thing Bitwarden actually uses for autofill:
+extra entries in ``login.uris``. Each emitted URI carries a ``match`` mode chosen
+to reproduce how KeePassXC itself would have matched that URL string:
+
+* KeePassXC's default matching is **host-based** -- a stored URL matches its base
+  domain and all subdomains, ignoring path/query/fragment for inclusion. The
+  faithful Bitwarden equivalent is **base domain (0)**, which is the default for
+  a plain string.
+* KeePassXC honours two inline syntaxes **on additional URLs only**: a
+  double-quoted string is an *exact* match, and a ``*`` is a wildcard. These map
+  to **exact (3)** and **starts-with (2)** / **regex (4)** respectively.
+* Non-web schemes (``keepassxc://``, ``cmd://``, ``kdbx://``, ``file://``) and
+  unresolved ``{REF:...}`` placeholders are dropped -- they are not site URLs and
+  would only leave dead URIs behind.
+
+Two orthogonal knobs steer the behaviour:
+
+* ``plain_match`` -- what a no-encoded-intent (plain) string becomes. Defaults to
+  ``None`` (defer to the user's Bitwarden account default -- what Bitwarden itself
+  writes on export); pass ``0`` for base-domain to faithfully replicate
+  KeePassXC's host-based matching regardless of the account default.
+* ``interpret_syntax`` -- whether the quote/wildcard conventions are honoured at
+  all. With it off, every additional URL is treated as a plain string (the
+  scheme/garbage drops still apply), for a deliberately literal import.
+
+Important caveat on regex: Bitwarden applies a single regex to the **whole URL**
+(unanchored, case-insensitive), whereas KeePassXC regexes host and path
+*separately*. The wildcard->regex translation here is therefore a best-effort
+whole-URL pattern, not a byte-for-byte copy of KeePassXC's internal regex;
+complex wildcards are emitted with a warning so the user can review them.
+"""
+
+import logging
+import re
+from collections.abc import Iterable
+from typing import Literal
+
+from .bw_types import BwField, BwUri
+
+logger = logging.getLogger(__name__)
+
+# Bitwarden URI match-detection modes; ``None`` means "use the account default".
+type UriMatchValue = Literal[0, 1, 2, 3, 4, 5] | None
+
+# Symbolic names accepted by the --uri-match / KP2BW_URI_MATCH knob. ``domain``
+# is the faithful KeePassXC-replication setting; ``default``/``null`` defer to the
+# user's Bitwarden account default.
+_MATCH_NAMES: dict[str, UriMatchValue] = {
+    "domain": 0,
+    "host": 1,
+    "startswith": 2,
+    "exact": 3,
+    "regex": 4,
+    "never": 5,
+    "default": None,
+    "null": None,
+}
+
+# Additional-URL attribute names: the KeePass2Android/KeePassXC ``KP2A_URL`` /
+# ``KP2A_URL_<n>`` convention, plus the plainer ``URL`` / ``URL_<n>`` convention
+# some entries use. Both are unambiguously "extra autofill URLs"; free-text
+# labels like "API Url" or "Alt. URL" are deliberately *not* matched -- folding
+# those would wrongly autofill API endpoints and other metadata.
+_ADDITIONAL_URL_RE = re.compile(r"^(?:KP2A_URL|URL)(_\d+)?$")
+# Android package attribute names. The underscore is optional so both the
+# ``AndroidApp_<n>`` and the no-underscore ``AndroidApp<n>`` variants are caught.
+_ANDROID_APP_RE = re.compile(r"^AndroidApp(_?\d+)?$")
+
+# Schemes that are never site URLs and must not become Bitwarden URIs.
+_DROP_SCHEMES: tuple[str, ...] = ("keepassxc://", "cmd://", "kdbx://", "file://")
+# Unresolved KeePass field-reference placeholder.
+_KP_REF_MARKER = "{REF:"
+# Characters KeePassXC rejects in a URL (`isUrlValid`); we drop strings carrying them.
+_ILLEGAL_URL_CHARS = re.compile(r"[<>^`{|}]")
+_ANDROID_APP_SCHEME = "androidapp://"
+
+# Curated two-level public suffixes for the registrable-domain heuristic behind
+# the --report-uris collision report. Not the full Public Suffix List -- just the
+# common multi-level TLDs -- so e.g. ``10bis.co.il`` collapses to ``10bis.co.il``
+# rather than ``co.il``. A miss only mis-groups a report line; it never touches
+# migration behaviour.
+_TWO_LEVEL_SUFFIXES: frozenset[str] = frozenset({
+    "co.uk",
+    "org.uk",
+    "gov.uk",
+    "ac.uk",
+    "me.uk",
+    "net.uk",
+    "sch.uk",
+    "co.il",
+    "org.il",
+    "net.il",
+    "ac.il",
+    "gov.il",
+    "co.jp",
+    "or.jp",
+    "ne.jp",
+    "ac.jp",
+    "go.jp",
+    "co.kr",
+    "or.kr",
+    "co.nz",
+    "org.nz",
+    "govt.nz",
+    "co.za",
+    "org.za",
+    "co.in",
+    "net.in",
+    "org.in",
+    "co.id",
+    "co.th",
+    "in.th",
+    "com.au",
+    "net.au",
+    "org.au",
+    "edu.au",
+    "gov.au",
+    "com.br",
+    "net.br",
+    "com.mx",
+    "com.tr",
+    "com.cn",
+    "net.cn",
+    "com.sg",
+    "com.hk",
+    "com.tw",
+    "com.ar",
+    "com.co",
+    "com.ua",
+    "com.pl",
+    "com.ru",
+    "co.cr",
+})
+
+
+def match_value_names() -> tuple[str, ...]:
+    """Return the accepted --uri-match names, for help text and arg validation."""
+    return tuple(_MATCH_NAMES)
+
+
+def parse_match_name(name: str) -> UriMatchValue:
+    """Resolve a symbolic match name to its Bitwarden value (or ``None``).
+
+    Raises :class:`ValueError` on an unknown name so the CLI/env layer can report
+    it with the list of valid options.
+    """
+    key = name.strip().lower()
+    if key not in _MATCH_NAMES:
+        valid = ", ".join(_MATCH_NAMES)
+        raise ValueError(f"Invalid URI match mode {name!r}; choose one of: {valid}")
+    return _MATCH_NAMES[key]
+
+
+def is_url_attribute_key(key: str) -> bool:
+    """True for KeePass keys that hold URLs/app ids handled as login URIs.
+
+    Used by the converter to keep these out of the custom-fields section -- they
+    are folded into ``login.uris`` instead.
+    """
+    return bool(_ADDITIONAL_URL_RE.match(key)) or bool(_ANDROID_APP_RE.match(key))
+
+
+def is_additional_url_key(key: str) -> bool:
+    """True for ``KP2A_URL`` / ``KP2A_URL_<n>`` additional-URL attribute names."""
+    return bool(_ADDITIONAL_URL_RE.match(key))
+
+
+def is_android_app_key(key: str) -> bool:
+    """True for ``AndroidApp`` / ``AndroidApp_<n>`` package attribute names."""
+    return bool(_ANDROID_APP_RE.match(key))
+
+
+def url_attribute_index(key: str) -> int:
+    """Stable sort index for a URL attribute: bare name first, then by suffix.
+
+    ``KP2A_URL`` -> -1, ``KP2A_URL_2`` -> 2, ``KP2A_URL_10`` -> 10, and the
+    no-underscore ``AndroidApp1`` -> 1, so the emitted URI order is deterministic
+    across runs (the dedup content-diff compares the ``uris`` list positionally,
+    so a stable order avoids spurious "changed" runs).
+    """
+    match = re.search(r"(\d+)$", key)
+    return int(match.group(1)) if match else -1
+
+
+def _android_uri(package: str) -> BwUri | None:
+    """Build an ``androidapp://`` URI from a package id, or ``None`` if empty.
+
+    ``match`` is left unset (account default): Bitwarden matches Android apps by
+    package id, so a URL match mode does not apply.
+    """
+    pkg = package.strip()
+    if not pkg:
+        return None
+    if not pkg.startswith(_ANDROID_APP_SCHEME):
+        pkg = f"{_ANDROID_APP_SCHEME}{pkg}"
+    return BwUri(uri=pkg)
+
+
+def _split_packages(value: str) -> list[str]:
+    """Split an AndroidApp attribute into package ids (comma/whitespace separated)."""
+    return [p for p in re.split(r"[\s,]+", value.strip()) if p]
+
+
+def _host_part(url: str) -> str:
+    """Return the host portion of *url* (between scheme:// and the first '/')."""
+    after_scheme = url.split("://", 1)[-1]
+    return after_scheme.split("/", 1)[0]
+
+
+def _is_invalid_wildcard(glob: str) -> bool:
+    """Reproduce KeePassXC's wildcard validity rejections (the common subset).
+
+    Rejects double/adjacent wildcards, all-wildcard strings, and bare TLD
+    wildcards like ``*.com`` -- inputs KeePassXC itself refuses, so we never emit
+    a Bitwarden URI for them. (Public-suffix edge cases such as ``*.co.uk`` are a
+    documented minor divergence.)
+    """
+    if "**" in glob or "*.*" in glob:
+        return True
+    # A string that is only wildcards / separators carries no real target.
+    if not glob.replace("*", "").replace(".", "").replace("/", "").replace(":", ""):
+        return True
+    host = _host_part(glob)
+    # `*.com` style: a wildcard label in front of a single bare TLD label.
+    return host.startswith("*.") and "." not in host[2:]
+
+
+def _trailing_path_wildcard_prefix(s: str) -> str | None:
+    """If *s* is a trailing-path-only wildcard, return the literal prefix.
+
+    e.g. ``https://host/app/*`` -> ``https://host/app/`` for a starts-with (2)
+    match. Returns ``None`` when the wildcard is in the host or appears interior,
+    which need the regex path instead.
+    """
+    if s.count("*") != 1 or not s.endswith("*"):
+        return None
+    if "*" in _host_part(s):
+        return None
+    return s[:-1]
+
+
+def _glob_to_regex(glob: str) -> str:
+    """Best-effort whole-URL regex for a wildcard URL (Bitwarden match mode 4).
+
+    Bitwarden applies one regex to the entire URL (unanchored, case-insensitive),
+    unlike KeePassXC's separate host/path regexes, so this expands each ``*`` to
+    ``.*`` over the regex-escaped literal rather than copying KeePassXC's internal
+    pattern. Faithful enough for autofill on the intended URLs; emitted with a
+    warning by the caller for human review.
+    """
+    return ".*".join(re.escape(part) for part in glob.split("*"))
+
+
+def _classify_additional_url(
+    raw: str, *, plain_match: UriMatchValue, interpret_syntax: bool
+) -> BwUri | None:
+    """Map a single additional-URL string to a Bitwarden URI, or ``None`` to drop.
+
+    Drops (scheme/reference/garbage) apply in every mode; the quote and wildcard
+    interpretations are skipped when *interpret_syntax* is off, so the string is
+    emitted as a plain URI instead.
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    # Reasons are logged WITHOUT the URL value: this lands in the always-on debug
+    # log, which users are encouraged to share for troubleshooting, and entry URLs
+    # are vault data.
+    if s.lower().startswith(_DROP_SCHEMES):
+        logger.debug("Dropping a non-web-scheme URL from URIs")
+        return None
+    if _KP_REF_MARKER in s:
+        logger.debug("Dropping an unresolved field-reference URL from URIs")
+        return None
+    if _ILLEGAL_URL_CHARS.search(s):
+        logger.debug("Dropping a URL with illegal characters from URIs")
+        return None
+
+    if interpret_syntax:
+        if len(s) >= 2 and s.startswith('"') and s.endswith('"'):
+            inner = s[1:-1]
+            if not inner or "*" in inner:
+                logger.debug("Dropping an invalid quoted-exact URL")
+                return None
+            return BwUri(uri=inner, match=3)
+        if "*" in s:
+            if _is_invalid_wildcard(s):
+                logger.debug("Dropping an invalid wildcard URL")
+                return None
+            prefix = _trailing_path_wildcard_prefix(s)
+            if prefix is not None:
+                return BwUri(uri=prefix, match=2)
+            logger.warning(
+                "A wildcard URL was migrated as a regex match; review your "
+                "wildcard entries in Bitwarden -- complex wildcard fidelity is "
+                "best-effort"
+            )
+            return BwUri(uri=_glob_to_regex(s), match=4)
+
+    return BwUri(uri=s, match=plain_match)
+
+
+def build_login_uris(
+    *,
+    primary_url: str,
+    additional_urls: list[str],
+    android_packages: list[str],
+    plain_match: UriMatchValue = None,
+    interpret_syntax: bool = True,
+) -> list[BwUri]:
+    """Build the ordered, de-duplicated ``login.uris`` list for an entry.
+
+    The primary URL is always treated as a plain string (KeePassXC honours the
+    quote/wildcard syntax only on *additional* URLs), additional URLs go through
+    :func:`_classify_additional_url`, and each Android package becomes an
+    ``androidapp://`` URI. Duplicate URI values are collapsed, first occurrence
+    winning, so the primary URL is never repeated by an identical alias.
+    """
+    uris: list[BwUri] = []
+    seen: set[str] = set()
+
+    def _add(uri: BwUri | None) -> None:
+        if uri is None:
+            return
+        if uri["uri"] in seen:
+            return
+        seen.add(uri["uri"])
+        uris.append(uri)
+
+    primary = primary_url.strip()
+    if primary:
+        _add(BwUri(uri=primary, match=plain_match))
+    for raw in additional_urls:
+        _add(
+            _classify_additional_url(
+                raw, plain_match=plain_match, interpret_syntax=interpret_syntax
+            )
+        )
+    for value in android_packages:
+        for package in _split_packages(value):
+            _add(_android_uri(package))
+
+    return uris
+
+
+def remap_item_fields_to_uris(
+    fields: list[BwField],
+    uris: list[BwUri],
+    *,
+    plain_match: UriMatchValue = None,
+    interpret_syntax: bool = True,
+) -> tuple[list[BwField], list[BwUri], bool]:
+    """Re-fold an already-imported item's URL/app *custom fields* into URIs.
+
+    The Bitwarden-only counterpart of the new-import path, for items that predate
+    it: ``KP2A_URL*`` / ``AndroidApp`` custom fields are removed and converted to
+    login URIs, appended to the item's existing URIs and de-duplicated by value.
+    Returns ``(kept_fields, merged_uris, changed)`` -- *changed* is ``False`` when
+    the item carries no such fields, so the caller can skip an unnecessary PUT.
+    """
+    kept_fields: list[BwField] = []
+    url_attrs: list[tuple[int, str]] = []
+    app_attrs: list[tuple[int, str]] = []
+    for field in fields:
+        name = field.get("name") or ""
+        if not is_url_attribute_key(name):
+            kept_fields.append(field)
+            continue
+        value = field.get("value") or ""
+        if value:
+            bucket = app_attrs if is_android_app_key(name) else url_attrs
+            bucket.append((url_attribute_index(name), value))
+
+    if len(kept_fields) == len(fields):
+        return fields, uris, False
+
+    derived = build_login_uris(
+        primary_url="",
+        additional_urls=[v for _, v in sorted(url_attrs)],
+        android_packages=[v for _, v in sorted(app_attrs)],
+        plain_match=plain_match,
+        interpret_syntax=interpret_syntax,
+    )
+    existing_values = {u["uri"] for u in uris}
+    merged = list(uris) + [d for d in derived if d["uri"] not in existing_values]
+    return kept_fields, merged, True
+
+
+def uri_host(uri: str) -> str | None:
+    """Extract the lowercase host from a URI, or ``None`` when it has none.
+
+    Strips scheme, userinfo, port, and path; skips ``androidapp://`` app URIs and
+    bare strings without a dot (intranet labels, junk) that carry no domain.
+    """
+    s = uri.strip().lower()
+    if not s or s.startswith(_ANDROID_APP_SCHEME):
+        return None
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    host = s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    host = host.split("@")[-1].split(":", 1)[0]
+    return host if "." in host else None
+
+
+def registrable_domain(host: str) -> str:
+    """Best-effort registrable domain (eTLD+1) of *host*.
+
+    Uses the curated :data:`_TWO_LEVEL_SUFFIXES` set rather than the full Public
+    Suffix List, which is good enough for the collision report where a rare miss
+    only mis-groups one line.
+    """
+    parts = [p for p in host.lower().strip(".").split(".") if p]
+    if len(parts) < 2:
+        return host
+    if ".".join(parts[-2:]) in _TWO_LEVEL_SUFFIXES and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def collision_groups(uris: Iterable[str]) -> dict[str, list[str]]:
+    """Group URI hosts by registrable domain, keeping only multi-host groups.
+
+    These are the registrable domains under which more than one distinct host is
+    stored -- i.e. the logins that all surface together under Bitwarden's
+    base-domain match, and the candidates for switching to Host match. Each value
+    is the sorted distinct host list.
+    """
+    groups: dict[str, set[str]] = {}
+    for uri in uris:
+        host = uri_host(uri)
+        if host is None:
+            continue
+        groups.setdefault(registrable_domain(host), set()).add(host)
+    return {base: sorted(hosts) for base, hosts in groups.items() if len(hosts) > 1}

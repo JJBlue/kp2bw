@@ -22,6 +22,7 @@ from . import VERBOSE
 from ._console import console
 from .bw_types import BwCollection, BwFolder, BwItemCreate, BwItemResponse
 from .exceptions import BitwardenClientError
+from .uri_mapping import UriMatchValue, remap_item_fields_to_uris
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,17 @@ class StripResult(NamedTuple):
 
     scanned: int
     stripped: int
+
+
+class MigrateResult(NamedTuple):
+    """Outcome of a :meth:`BitwardenServeClient.migrate_url_fields_to_uris` pass.
+
+    *scanned* is every in-scope item inspected; *migrated* is the subset that
+    carried ``KP2A_URL*`` / ``AndroidApp`` fields and was rewritten to URIs.
+    """
+
+    scanned: int
+    migrated: int
 
 
 # Actionable message shown when the Bitwarden CLI cannot be located.
@@ -333,25 +345,65 @@ def terminate_serve(
     catches a worker that outlived or re-parented away from its wrapper.
     """
     if process.poll() is None:
-        if via_shell and os.name == "nt":
-            # terminate() would reach only the cmd.exe wrapper; take the tree.
-            _ = subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                check=False,
-                capture_output=True,
-                stdin=subprocess.DEVNULL,
-            )
-            try:
-                _ = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                logger.warning("bw serve did not exit after taskkill /T")
+        if os.name == "nt":
+            if via_shell:
+                # terminate() would reach only the cmd.exe wrapper; take the tree.
+                _ = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    check=False,
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                )
+                try:
+                    _ = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    logger.warning("bw serve did not exit after taskkill /T")
+            else:
+                process.terminate()
+                try:
+                    _ = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    logger.warning("bw serve did not exit on SIGTERM, sending SIGKILL")
+                    process.kill()
+                    try:
+                        _ = process.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        logger.warning("bw serve did not exit after SIGKILL")
         else:
-            process.terminate()
+            # POSIX: bw is commonly a node launcher that spawns a worker; killing
+            # only the tracked PID orphans the worker -- it keeps the port and,
+            # when kp2bw's stdout is a pipe, holds it open so the parent pipeline
+            # never reaches EOF (a multi-minute "still running" hang). bw serve
+            # runs in its own session (start_new_session=True), so when the
+            # process leads its own group we signal the whole group to take the
+            # launcher and worker down together.
+            try:
+                pgid = os.getpgid(process.pid)
+            except ProcessLookupError:
+                pgid = None
+
+            def _signal(sig: int) -> None:
+                # Group-signal ONLY a real group leader (getpgid == pid, what
+                # start_new_session guarantees); otherwise a single-PID kill, so
+                # we never signal kp2bw's own group (e.g. a process a caller
+                # spawned without its own session).
+                if pgid is not None and pgid == process.pid:
+                    os.killpg(pgid, sig)
+                else:
+                    os.kill(process.pid, sig)
+
+            try:
+                _signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 _ = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 logger.warning("bw serve did not exit on SIGTERM, sending SIGKILL")
-                process.kill()
+                try:
+                    _signal(signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 try:
                     _ = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -678,6 +730,12 @@ class BitwardenServeClient:
                 stderr=subprocess.PIPE,
                 cwd=self._bw_cwd,
                 env=env,
+                # POSIX: run bw serve in its own session/process group so teardown
+                # can kill the launcher *and* its node worker together (see
+                # terminate_serve). Without this an orphaned worker keeps the port
+                # and, when our stdout is a pipe, holds it open -> the parent
+                # pipeline hangs. Ignored on Windows (taskkill /T handles the tree).
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise BitwardenClientError(BW_NOT_FOUND_MSG) from exc
@@ -964,6 +1022,48 @@ class BitwardenServeClient:
             f"Stripped {field_name} from {stripped} of {len(items)} scanned items"
         )
         return StripResult(scanned=len(items), stripped=stripped)
+
+    def migrate_url_fields_to_uris(
+        self, *, plain_match: UriMatchValue, interpret_syntax: bool
+    ) -> MigrateResult:
+        """Re-fold legacy ``KP2A_URL*`` / ``AndroidApp`` custom fields into URIs.
+
+        The Bitwarden-only upgrade pass for users who imported before URL folding
+        and do not want to re-import: each in-scope login item carrying those
+        fields is rewritten so they become login URIs (appended to existing ones,
+        de-duplicated) and the redundant fields are dropped.  Scope mirrors a
+        migration (the configured org/collection, else the personal vault). Items
+        without such fields are left untouched; only changed items are PUT.
+        Safe to repeat -- a second pass finds nothing left to migrate.
+        """
+        items = self.list_items(
+            organization_id=self._org_id,
+            collection_id=self._collection_id,
+        )
+        migrated = 0
+        for item in items:
+            if item.get("type") != _BW_ITEM_TYPE_LOGIN:
+                continue
+            login = item.get("login")
+            if login is None:
+                continue
+            new_fields, new_uris, changed = remap_item_fields_to_uris(
+                item.get("fields") or [],
+                login.get("uris") or [],
+                plain_match=plain_match,
+                interpret_syntax=interpret_syntax,
+            )
+            if not changed:
+                continue
+            item["fields"] = new_fields
+            login["uris"] = new_uris
+            item["login"] = login
+            self.update_item(item["id"], item)
+            migrated += 1
+        logger.info(
+            f"Migrated URL fields to URIs on {migrated} of {len(items)} scanned items"
+        )
+        return MigrateResult(scanned=len(items), migrated=migrated)
 
     def create_items_batch(
         self,

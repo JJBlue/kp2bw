@@ -31,6 +31,13 @@ from .bw_types import (
 )
 from .exceptions import BitwardenClientError, ConversionError
 from .otp import resolve_otp
+from .uri_mapping import (
+    UriMatchValue,
+    build_login_uris,
+    is_android_app_key,
+    is_url_attribute_key,
+    url_attribute_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +122,65 @@ def _print_summary(
         )
 
 
+def _entry_url_inputs(entry: Entry) -> tuple[str, list[str], list[str]]:
+    """``(primary url, additional URLs, android packages)`` for a KeePass entry.
+
+    Mirrors the extraction in :meth:`Converter._add_bw_entry_to_entries_dict`
+    (suffix-ordered for determinism) so callers that need an entry's would-be
+    ``login.uris`` -- the report and REF merging -- fold the same inputs the
+    migration does.
+    """
+    url_attrs: list[tuple[int, str]] = []
+    app_attrs: list[tuple[int, str]] = []
+    for key, value in entry.custom_properties.items():
+        if value and is_url_attribute_key(key):
+            bucket = app_attrs if is_android_app_key(key) else url_attrs
+            bucket.append((url_attribute_index(key), value))
+    return (
+        entry.url or "",
+        [v for _, v in sorted(url_attrs)],
+        [v for _, v in sorted(app_attrs)],
+    )
+
+
+def collect_keepass_uris(
+    keepass_file_path: str,
+    keepass_password: str | None,
+    keepass_keyfile_path: str | None,
+    *,
+    uri_match: UriMatchValue = None,
+    interpret_uri_syntax: bool = True,
+) -> list[str]:
+    """Return the login-URI values migration would write for every entry.
+
+    Read-only helper for the ``--report-uris keepass`` collision report: each
+    entry's primary URL plus its ``KP2A_URL*`` / ``URL_*`` / ``AndroidApp*``
+    attributes are run through the same :func:`build_login_uris` the migration
+    uses, so the report previews exactly the URIs that would be written --
+    including quote/wildcard transforms and dropped non-web schemes -- not the
+    raw values.
+    """
+    kp = PyKeePass(
+        filename=keepass_file_path,
+        password=keepass_password,
+        keyfile=keepass_keyfile_path,
+    )
+    uris: list[str] = []
+    for entry in kp.entries:
+        primary, additional, android = _entry_url_inputs(entry)
+        uris.extend(
+            bw_uri["uri"]
+            for bw_uri in build_login_uris(
+                primary_url=primary,
+                additional_urls=additional,
+                android_packages=android,
+                plain_match=uri_match,
+                interpret_syntax=interpret_uri_syntax,
+            )
+        )
+    return uris
+
+
 class Converter:
     _keepass_file_path: str
     _keepass_password: str | None
@@ -130,6 +196,8 @@ class Converter:
     _migrate_metadata: bool
     _update_existing: bool
     _include_oversize_secrets: bool
+    _uri_match: UriMatchValue
+    _interpret_uri_syntax: bool
     _kp_ref_entries: list[Entry]
     _entries: dict[str, EntryValue]
     _member_reference_resolving_dict: dict[str, str]
@@ -154,6 +222,8 @@ class Converter:
         migrate_metadata: bool = True,
         update_existing: bool = True,
         include_oversize_secrets: bool = False,
+        uri_match: UriMatchValue = None,
+        interpret_uri_syntax: bool = True,
     ) -> None:
         """Initialise the converter with KeePass source and Bitwarden target settings."""
         self._keepass_file_path = keepass_file_path
@@ -170,6 +240,8 @@ class Converter:
         self._migrate_metadata = migrate_metadata
         self._update_existing = update_existing
         self._include_oversize_secrets = include_oversize_secrets
+        self._uri_match = uri_match
+        self._interpret_uri_syntax = interpret_uri_syntax
         self._kp_ref_entries = []
         self._entries = {}
         self._ref_entries_by_uuid = {}
@@ -236,9 +308,22 @@ class Converter:
         password: str,
         custom_properties: dict[str, FieldSpec],
         fido2_credentials: list[BwFido2Credential] | None = None,
+        additional_urls: list[str] | None = None,
+        android_packages: list[str] | None = None,
     ) -> BwItemCreate:
-        """Build a Bitwarden item dict from individual entry fields."""
-        uris: list[BwUri] = [BwUri(uri=url, match=None)] if url else []
+        """Build a Bitwarden item dict from individual entry fields.
+
+        The primary ``url`` plus any KeePass(XC) additional URLs and Android
+        package ids are folded into ``login.uris`` with per-URI match modes (see
+        :mod:`kp2bw.uri_mapping`), rather than left as inert custom fields.
+        """
+        uris: list[BwUri] = build_login_uris(
+            primary_url=url,
+            additional_urls=additional_urls or [],
+            android_packages=android_packages or [],
+            plain_match=self._uri_match,
+            interpret_syntax=self._interpret_uri_syntax,
+        )
         login: BwItemLogin = BwItemLogin(
             uris=uris,
             username=username,
@@ -359,9 +444,20 @@ class Converter:
             logger.warning(f"{entry.title or '_untitled'}: {warning}")
 
         custom_properties: dict[str, FieldSpec] = {}
+        # KeePass(XC) additional URLs / Android packages are folded into
+        # login.uris (not custom fields); collected here keyed by their suffix so
+        # the emitted URI order is deterministic across re-runs.
+        url_attrs: list[tuple[int, str]] = []
+        app_attrs: list[tuple[int, str]] = []
         for key, value in custom_props.items():
             # Skip passkey attributes and OTP fields folded into login.totp.
             if key.startswith(KPEX_PASSKEY_PREFIX) or key in otp_result.consumed_keys:
+                continue
+            # Route URL/app attributes to login.uris instead of custom fields.
+            if is_url_attribute_key(key):
+                if value:
+                    bucket = app_attrs if is_android_app_key(key) else url_attrs
+                    bucket.append((url_attribute_index(key), value))
                 continue
             # A value over the item-size limit is offloaded to a <key>.txt
             # attachment below (mirroring the notes handling); keep it out of the
@@ -415,6 +511,8 @@ class Converter:
             password=entry.password if entry.password else "",
             custom_properties=custom_properties,
             fido2_credentials=fido2_credentials,
+            additional_urls=[v for _, v in sorted(url_attrs)],
+            android_packages=[v for _, v in sorted(app_attrs)],
         )
 
         # get attachments to store later on. A value over the inline size limit
@@ -692,12 +790,22 @@ class Converter:
                     break
 
             if username_and_password_match and ref_result is not None:
-                # => add url to bw_item => username / pw identical
+                # => merge this entry's URLs into the referent (same creds). Fold
+                # the full set (primary + KP2A_URL*/URL_*/AndroidApp*) the same way
+                # migration would, and append only URIs not already present.
                 _, _, ref_item, _ = self._unpack_entry(ref_result)
-                if kp_entry.url:
-                    ref_item["login"]["uris"].append(
-                        BwUri(uri=kp_entry.url, match=None)
-                    )
+                existing_uris = ref_item["login"]["uris"]
+                existing_values = {u.get("uri") for u in existing_uris}
+                primary, additional, android = _entry_url_inputs(kp_entry)
+                for bw_uri in build_login_uris(
+                    primary_url=primary,
+                    additional_urls=additional,
+                    android_packages=android,
+                    plain_match=self._uri_match,
+                    interpret_syntax=self._interpret_uri_syntax,
+                ):
+                    if bw_uri["uri"] not in existing_values:
+                        existing_uris.append(bw_uri)
                 canonical = ref_result
             else:
                 # => create new bitwarden item
