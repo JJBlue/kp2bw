@@ -8,6 +8,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-06-22
+
 ### Added
 
 - **`--bitwarden-collection nested` -- recreate the full KeePass folder hierarchy as nested collections** (issue #33, PR
@@ -559,7 +561,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 [`jampe/kp2bw@c9ef571eabd345db94751f7dec845e49756e9d47`](https://github.com/jampe/kp2bw/commit/c9ef571eabd345db94751f7dec845e49756e9d47)
 
-[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.6.0...HEAD
+[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.7.0...HEAD
+[3.7.0]: https://github.com/kjanat/kp2bw/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/kjanat/kp2bw/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/kjanat/kp2bw/compare/v3.4.1...v3.5.0
 [3.4.1]: https://github.com/kjanat/kp2bw/compare/v3.4.0...v3.4.1
