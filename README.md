@@ -212,6 +212,6 @@ See [TROUBLESHOOTING].
 
 ["🧪 Test this PR"]: https://github.com/kjanat/kp2bw/pull/34#issuecomment-4763225590 "Example"
 [Bitwarden CLI]: https://bitwarden.com/help/cli/
-[TROUBLESHOOTING]: ./TROUBLESHOOTING.md
-[`.env.example`]: ./.env.example
+[TROUBLESHOOTING]: https://github.com/kjanat/kp2bw/blob/HEAD/TROUBLESHOOTING.md
+[`.env.example`]: https://github.com/kjanat/kp2bw/blob/HEAD/.env.example
 [jampe/kp2bw]: https://github.com/jampe/kp2bw
