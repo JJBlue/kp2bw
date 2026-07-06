@@ -1,5 +1,5 @@
-{
-	"extends": "https://github.com/kjanat/kjanat/raw/886a886/configs/dprint.remote.json",
+{ // git ls-remote https://github.com/kjanat/kjanat.git HEAD | awk '{print $1}' | xargs -r -I{} sed -i -E 's#(github\.com/kjanat/kjanat/raw/)[0-9a-f]{4,40}(/configs/dprint\.remote\.json)#\1{}\2#g' .dprint.jsonc
+	"extends": "https://github.com/kjanat/kjanat/raw/e5f1f67826482d79679c1eebc0e0221683b7107d/configs/dprint.remote.json",
 	"dockerfile": { "associations": ["!*.ts"] },
 	"excludes": ["**/*fixtures*/**", "**/*snapshots*/**"],
 	"markdown": {
@@ -7,12 +7,15 @@
 		"textWrap": "always",
 	},
 	"exec": {
+		"cwd": "${configDir}",
 		"commands": [{
-			"command": "uvx tombi format - --stdin-filename {{file_path}}",
+			"command": "tombi format - --stdin-filename {{file_path}}",
 			"exts": ["toml"],
+			"cacheKeyFiles": ["tombi.toml"],
+			"setupCommand": "npm i -g tombi",
 		}],
 	},
 	"plugins": [
-		"https://plugins.dprint.dev/exec-0.6.2.json@df98f54ffd3092b8a841aedd6d098a2651f16d0a796a40535774f1a8b4b9d463",
+		"https://plugins.dprint.dev/exec-0.7.2.json@6c30bd00dfb176774ece412d0fbf149478269ecc92c55ab2d6f4116938ed993e",
 	],
 }
