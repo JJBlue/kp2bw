@@ -8,6 +8,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [3.7.1] - 2026-07-10
+
+### Added
+
+- **The package is now MIT-licensed** (issue #22). Upstream [jampe/kp2bw](https://github.com/jampe/kp2bw) added an MIT
+  license (jampe/kp2bw#54), unblocking relicensing of the derived code. A `LICENSE` file now ships at the repo root and
+  in the wheel/sdist, crediting both Daniel Jampen (upstream) and Kaj Kowalski (this fork), and the package metadata
+  carries `License-Expression: MIT` so PyPI displays the license.
+
 ## [3.7.0] - 2026-06-22
 
 ### Added
@@ -561,7 +570,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 [`jampe/kp2bw@c9ef571eabd345db94751f7dec845e49756e9d47`](https://github.com/jampe/kp2bw/commit/c9ef571eabd345db94751f7dec845e49756e9d47)
 
-[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.7.0...HEAD
+[Unreleased]: https://github.com/kjanat/kp2bw/compare/v3.7.1...HEAD
+[3.7.1]: https://github.com/kjanat/kp2bw/compare/v3.7.0...v3.7.1
 [3.7.0]: https://github.com/kjanat/kp2bw/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/kjanat/kp2bw/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/kjanat/kp2bw/compare/v3.4.1...v3.5.0
